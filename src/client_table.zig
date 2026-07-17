@@ -49,7 +49,7 @@ pub fn collectStats(clients: *client.ClientTable) Stats {
 
 pub fn shardCount(requested: ?usize, client_count: usize) usize {
     if (client_count == 0) return 1;
-    const default_clients_per_shard = 4096;
+    const default_clients_per_shard = 200;
     const cpu_count = std.Thread.getCpuCount() catch 1;
     const default_shards = @min(std.math.divCeil(usize, client_count, default_clients_per_shard) catch 1, cpu_count);
     const normalized = @max(requested orelse default_shards, 1);
@@ -276,8 +276,10 @@ test "shardCount normalizes requested shards" {
     try std.testing.expectEqual(@as(usize, 1), shardCount(8, 0));
     const cpu_count = std.Thread.getCpuCount() catch 1;
     try std.testing.expectEqual(@as(usize, 1), shardCount(null, 100));
-    try std.testing.expectEqual(@min(@as(usize, 2), cpu_count), shardCount(null, 4097));
-    try std.testing.expectEqual(@min(@as(usize, 13), cpu_count), shardCount(null, 50_000));
+    try std.testing.expectEqual(@as(usize, 1), shardCount(null, 200));
+    try std.testing.expectEqual(@min(@as(usize, 2), cpu_count), shardCount(null, 201));
+    try std.testing.expectEqual(@min(@as(usize, 5), cpu_count), shardCount(null, 1000));
+    try std.testing.expectEqual(cpu_count, shardCount(null, 50_000));
 }
 
 test "shardFor distributes every requested client across available shards" {

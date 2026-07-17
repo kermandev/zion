@@ -39,7 +39,7 @@ pub fn writeUsage(writer: *Io.Writer) !void {
         \\  --handshake-host <host>     Unix-only handshake host. Default: localhost
         \\  --handshake-port <port>     Unix-only handshake port. Default: 25565
         \\  --clients <count>           Number of simulated clients (required)
-        \\  --shards <count>            Number of threads/shards. Default: auto-scaled by client count
+        \\  --shards <count>            Number of threads/shards. Default: about 200 clients per shard
         \\  --connect-rate <per-sec>    Connection rate per second. Default: 100
         \\  --username-prefix <prefix>  Prefix for client usernames. Default: "Zion"
         \\  --known-core-pack           Advertise minecraft:core for the compiled version

@@ -1,8 +1,8 @@
 # Zion
 
 Zion is a Linux load tester for Minecraft Java Edition servers. Written in Zig,
-it uses `io_uring` and sharded event loops to simulate thousands of offline mode
-clients with low per-client overhead.
+it uses `io_uring` and sharded event loops to run many offline mode protocol
+clients from one process.
 
 ## Requirements
 
@@ -44,7 +44,7 @@ CPU. The CPU ISA level does not change the Linux kernel requirement.
 Each platform has a `full` archive with every optional feature and a `minimal`
 archive built with `-Dminimal=true`. Archive names always end with the variant.
 
-Use the minimal preset for the smallest binary and lowest per-client overhead:
+Use the minimal preset to disable every optional feature:
 
 ```sh
 zig build -Doptimize=ReleaseFast -Dminimal=true
@@ -87,12 +87,15 @@ Run `zion --help` to see every runtime option.
 
 ### Transport targets
 
-IPv6 addresses are accepted directly. Pass them without brackets, even though
-Zion displays them in bracketed host-and-port form:
+Bare IPv6 addresses use the default port and do not need brackets:
 
 ```sh
 zion --target ::1 --clients 1000
 ```
+
+Use brackets when specifying an IPv6 port, for example
+`--target [::1]:25570`. Zion always displays IPv6 targets in bracketed
+host-and-port form.
 
 Zion can also connect through a filesystem Unix stream socket:
 
@@ -245,16 +248,17 @@ timed region. Use them to evaluate hot-kernel specialization. The default
 
 The target is resolved and probed once per run, then each shard reuses one
 precomputed socket address. Each shard owns one `io_uring`, its client state,
-scheduler, fixed-file socket table, registered receive buffer group, and
-protocol scratch buffers. Socket creation, options, connect, send, receive,
-shutdown, and close all run through `io_uring`; fixed slot `N` belongs to client
-`N` for the lifetime of that connection.
+scheduler, fixed-file socket table, provided-buffer ring, and protocol scratch
+buffers. Within a shard, socket creation, options, connect, send, receive,
+shutdown, and close all run through `io_uring`. Each shard-local client keeps
+the same fixed-file slot for the lifetime of a connection.
 
 On kernels advertising receive/send bundles, one receive completion may cover
 multiple contiguous 4 KiB provided buffers. Zion falls back to ordinary
 multishot receives with 16 KiB buffers when the feature is unavailable.
-Complete packets are parsed directly from those buffers; only fragmented packet
-tails are copied into per-client storage.
+Complete uncompressed packets are parsed directly from receive buffers, while
+compressed packets use shard-local decompression scratch storage. Only
+fragmented packet tails are copied into per-client storage.
 
 Client handlers report explicit effects so ignored inbound packets do not touch
 the timer wheel or write path. Cached broadcasts and client ticks are referenced
@@ -271,6 +275,13 @@ infrastructure in front of it. You are responsible for choosing safe limits,
 monitoring the target, and complying with applicable laws and service-provider
 rules. The authors are not responsible for misuse or damage caused by this
 software.
+
+Automatic shard selection targets roughly 200 clients per shard and is capped
+by the logical CPUs available to the process. This is a conservative starting
+point, not a latency guarantee. Movement broadcasts and other high-rate or
+fanout-heavy traffic can saturate a shard and delay keep-alive responses even
+at lower client counts. Monitor reconnects and use `--shards <count>` to
+increase concurrency when necessary.
 
 ## AI Disclaimer
 
