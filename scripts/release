@@ -6,8 +6,8 @@ if [[ -z "$version" ]]; then
     echo "error: could not read version from build.zig.zon" >&2
     exit 1
 fi
-if [[ -n "${GITHUB_REF_NAME:-}" && "$GITHUB_REF_NAME" != "v$version" ]]; then
-    echo "error: tag $GITHUB_REF_NAME does not match package version v$version" >&2
+if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" != "v$version" ]]; then
+    echo "error: tag ${GITHUB_REF_NAME:-} does not match package version v$version" >&2
     exit 1
 fi
 
