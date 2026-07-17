@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.17.0-dev.1415+64dfaa568
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: format
+      - run: zig fmt --check build.zig src
+
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            options: ""
+          - name: minimal
+            options: -Dminimal=true
+          - name: no-compression
+            options: -Denable-compression=false
+          - name: no-periodic-traffic
+            options: -Denable-movement=false -Denable-broadcast=false -Denable-client-tick=false
+          - name: release-safe
+            options: -Doptimize=ReleaseSafe
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: test-${{ matrix.name }}
+      - run: zig build test ${{ matrix.options }}
+
+  protocol-versions:
+    name: Protocol versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: protocol-versions
+      - name: Test every supported Minecraft version
+        run: |
+          while IFS= read -r version; do
+            zig build test -Dminecraft-version="$version"
+          done < <(zig run \
+            --dep minecraft_version_catalog \
+            -Mroot=scripts/minecraft_versions.zig \
+            -Mminecraft_version_catalog=src/protocol/versions/catalog.zig)
+
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: fuzz
+      - uses: actions/cache@v5
+        with:
+          path: .zig-cache/fuzz
+          key: fuzz-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**/*.zig') }}
+          restore-keys: |
+            fuzz-${{ runner.os }}-${{ env.ZIG_VERSION }}-
+      - run: scripts/fuzz 10K
+
+  release-artifacts:
+    name: Release artifacts (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x86_64-v3, x86_64-v4, aarch64]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: release-${{ matrix.platform }}
+      - run: scripts/release
+        env:
+          ZION_RELEASE_JOBS: 4
+          ZION_RELEASE_PLATFORM: ${{ matrix.platform }}
+      - name: Verify base x86-64-v3 artifacts
+        if: matrix.platform == 'x86_64-v3'
+        run: |
+          for variant in full minimal; do
+            archive="$(find dist -maxdepth 1 -name "*-linux-x86_64-v3-${variant}.tar.xz" -print -quit)"
+            test -n "$archive"
+            directory="${archive%.tar.xz}"
+            tar -xf "$archive" -C dist
+            dist/"${directory#dist/}"/zion --version
+            rm -rf "dist/${directory#dist/}"
+          done
+      - run: cd dist && sha256sum --check SHA256SUMS

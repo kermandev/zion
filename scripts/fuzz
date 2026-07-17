@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+limit="${1:-100K}"
+if [[ $# -gt 0 ]]; then
+    shift
+fi
+if [[ ! "$limit" =~ ^[1-9][0-9]*[KMG]?$ ]]; then
+    echo "usage: scripts/fuzz [iterations] [zig-build-options...]" >&2
+    echo "example: scripts/fuzz 100K -Dminimal=true" >&2
+    exit 2
+fi
+for arg in "$@"; do
+    if [[ "$arg" == "--cache-dir" || "$arg" == --cache-dir=* ]]; then
+        echo "error: scripts/fuzz owns --cache-dir; set ZION_FUZZ_CACHE instead" >&2
+        exit 2
+    fi
+done
+
+cache_key="default"
+if [[ $# -gt 0 ]]; then
+    cache_key="$(printf '%s\0' "$@" | sha256sum)"
+    cache_key="${cache_key%% *}"
+fi
+cache_root="${ZION_FUZZ_CACHE:-.zig-cache/fuzz}"
+cache_dir="$cache_root/$cache_key"
+log_file="$(mktemp)" || exit 1
+trap 'rm -f "$log_file"' EXIT
+
+echo "persistent fuzz cache: $cache_dir"
+zig build fuzz "--fuzz=$limit" --cache-dir "$cache_dir" "$@" 2>&1 | tee "$log_file"
+zig_status=${PIPESTATUS[0]}
+
+# Zig 0.17.0-dev can report a fuzz-child crash but still return success
+# from the build runner. Preserve builtin fuzzing while making bounded runs
+# trustworthy in scripts and CI.
+if grep -Eq "input saved to|terminated with signal|exited with code [1-9]" "$log_file"; then
+    exit 1
+fi
+exit "$zig_status"

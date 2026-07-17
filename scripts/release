@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+version="$(sed -n 's/^[[:space:]]*\.version = "\([^"]*\)",$/\1/p' build.zig.zon)"
+if [[ -z "$version" ]]; then
+    echo "error: could not read version from build.zig.zon" >&2
+    exit 1
+fi
+if [[ -n "${GITHUB_REF_NAME:-}" && "$GITHUB_REF_NAME" != "v$version" ]]; then
+    echo "error: tag $GITHUB_REF_NAME does not match package version v$version" >&2
+    exit 1
+fi
+
+source_date_epoch="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}"
+release_jobs="${ZION_RELEASE_JOBS:-1}"
+if [[ ! "$release_jobs" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: ZION_RELEASE_JOBS must be a positive integer" >&2
+    exit 1
+fi
+
+targets=(
+    x86_64-linux-musl
+    x86_64-linux-musl
+    aarch64-linux-musl
+)
+cpus=(x86_64_v3 x86_64_v4 baseline)
+platforms=(x86_64-v3 x86_64-v4 aarch64)
+variants=(full minimal)
+release_platform="${ZION_RELEASE_PLATFORM:-all}"
+platform_indices=()
+for index in "${!platforms[@]}"; do
+    if [[ "$release_platform" == all || "$release_platform" == "${platforms[$index]}" ]]; then
+        platform_indices+=("$index")
+    fi
+done
+if [[ ${#platform_indices[@]} -eq 0 ]]; then
+    echo "error: unsupported ZION_RELEASE_PLATFORM: $release_platform" >&2
+    exit 1
+fi
+
+rm -rf dist .zig-cache/release
+mkdir -p dist
+
+mapfile -t minecraft_versions < <(zig run \
+    --dep minecraft_version_catalog \
+    -Mroot=scripts/minecraft_versions.zig \
+    -Mminecraft_version_catalog=src/protocol/versions/catalog.zig)
+if [[ ${#minecraft_versions[@]} -eq 0 ]]; then
+    echo "error: Minecraft version catalog is empty" >&2
+    exit 1
+fi
+
+build_archive() {
+    local minecraft_version="$1"
+    local index="$2"
+    local variant="$3"
+    local name="zion-v${version}-mc${minecraft_version}-linux-${platforms[$index]}-${variant}"
+    local prefix=".zig-cache/release/$name"
+    local feature_options=()
+    if [[ "$variant" == minimal ]]; then
+        feature_options+=(-Dminimal=true)
+    fi
+
+    zig build \
+        -Doptimize=ReleaseFast \
+        -Dstrip=true \
+        -Dtarget="${targets[$index]}" \
+        -Dcpu="${cpus[$index]}" \
+        -Dminecraft-version="$minecraft_version" \
+        "${feature_options[@]}" \
+        --prefix "$prefix"
+
+    mkdir -p "dist/$name"
+    install -m755 "$prefix/bin/zion" "dist/$name/zion"
+    install -m644 README.md LICENSE "dist/$name/"
+    tar \
+        --sort=name \
+        --mtime="@$source_date_epoch" \
+        --owner=0 \
+        --group=0 \
+        --numeric-owner \
+        -cJf "dist/$name.tar.xz" \
+        -C dist "$name"
+    rm -rf "dist/$name"
+}
+
+wait_for_batch() {
+    local failed=0
+    local pid
+    for pid in "$@"; do
+        if ! wait "$pid"; then
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+pids=()
+for minecraft_version in "${minecraft_versions[@]}"; do
+    for index in "${platform_indices[@]}"; do
+        for variant in "${variants[@]}"; do
+            build_archive "$minecraft_version" "$index" "$variant" &
+            pids+=("$!")
+            if (( ${#pids[@]} == release_jobs )); then
+                wait_for_batch "${pids[@]}"
+                pids=()
+            fi
+        done
+    done
+done
+wait_for_batch "${pids[@]}"
+
+(
+    cd dist
+    sha256sum ./*.tar.xz > SHA256SUMS
+)

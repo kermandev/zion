@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.17.0-dev.1415+64dfaa568
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x86_64-v3, x86_64-v4, aarch64]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: release-${{ matrix.platform }}
+      - run: scripts/release
+        env:
+          ZION_RELEASE_JOBS: 4
+          ZION_RELEASE_PLATFORM: ${{ matrix.platform }}
+      - run: cd dist && sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*.tar.xz
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish draft release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Create combined checksums
+        run: cd dist && sha256sum ./*.tar.xz > SHA256SUMS && sha256sum --check SHA256SUMS
+      - name: Create or update draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --draft \
+              --generate-notes \
+              --title "$GITHUB_REF_NAME" \
+              --verify-tag
+          fi

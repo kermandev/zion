@@ -1,0 +1,6 @@
+.zig-cache/
+.idea/
+zig-out/
+dist/
+*.iml
+AGENTS.md
