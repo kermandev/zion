@@ -18,6 +18,7 @@ pub const Stats = struct {
     bytes_received: u64 = 0,
     bytes_sent: u64 = 0,
     duration_ms: u64 = 0,
+    diagnostics: stats_module.RunDiagnostics = if (stats_module.diagnostics_enabled) .{} else {},
 
     pub fn add(stats: *Stats, other: Stats) void {
         stats.requested += other.requested;
@@ -30,6 +31,7 @@ pub const Stats = struct {
         stats.keep_alives_answered += other.keep_alives_answered;
         stats.bytes_received += other.bytes_received;
         stats.bytes_sent += other.bytes_sent;
+        if (comptime stats_module.diagnostics_enabled) stats.diagnostics.add(other.diagnostics);
     }
 };
 
@@ -207,8 +209,18 @@ test "Stats.add aggregates shard counters without duration" {
         .bytes_sent = 1024,
         .duration_ms = 111,
     };
+    if (comptime stats_module.diagnostics_enabled) {
+        stats.diagnostics = .{
+            .recv_nobufs = 2,
+            .max_cq_ready = 64,
+            .keep_alive_send_samples = 1,
+            .keep_alive_send_total_ms = 3,
+            .keep_alive_send_max_ms = 3,
+            .disconnects = .{ .transport = 1 },
+        };
+    }
 
-    stats.add(.{
+    var other: Stats = .{
         .requested = 5,
         .connected = 2,
         .waiting = 1,
@@ -220,7 +232,18 @@ test "Stats.add aggregates shard counters without duration" {
         .bytes_received = 4096,
         .bytes_sent = 2048,
         .duration_ms = 999,
-    });
+    };
+    if (comptime stats_module.diagnostics_enabled) {
+        other.diagnostics = .{
+            .recv_nobufs = 5,
+            .max_cq_ready = 32,
+            .keep_alive_send_samples = 2,
+            .keep_alive_send_total_ms = 11,
+            .keep_alive_send_max_ms = 7,
+            .disconnects = .{ .server = 2 },
+        };
+    }
+    stats.add(other);
 
     try std.testing.expectEqual(@as(usize, 15), stats.requested);
     try std.testing.expectEqual(@as(usize, 6), stats.connected);
@@ -233,6 +256,15 @@ test "Stats.add aggregates shard counters without duration" {
     try std.testing.expectEqual(@as(u64, 12_288), stats.bytes_received);
     try std.testing.expectEqual(@as(u64, 3072), stats.bytes_sent);
     try std.testing.expectEqual(@as(u64, 111), stats.duration_ms);
+    if (comptime stats_module.diagnostics_enabled) {
+        try std.testing.expectEqual(@as(u64, 7), stats.diagnostics.recv_nobufs);
+        try std.testing.expectEqual(@as(u32, 64), stats.diagnostics.max_cq_ready);
+        try std.testing.expectEqual(@as(u64, 3), stats.diagnostics.keep_alive_send_samples);
+        try std.testing.expectEqual(@as(u64, 14), stats.diagnostics.keep_alive_send_total_ms);
+        try std.testing.expectEqual(@as(u64, 7), stats.diagnostics.keep_alive_send_max_ms);
+        try std.testing.expectEqual(@as(u64, 2), stats.diagnostics.disconnects.server);
+        try std.testing.expectEqual(@as(u64, 1), stats.diagnostics.disconnects.transport);
+    }
 }
 
 test "collectStats aggregates hot columns from client table" {

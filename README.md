@@ -66,7 +66,7 @@ zig build -Doptimize=ReleaseFast -Dminimal=true -Denable-compression=true
 | `-Denable-movement`    | `true`   | Idle, rotation, and bounded walking traffic         |
 | `-Denable-broadcast`   | `true`   | Periodic chat messages                              |
 | `-Denable-client-tick` | `true`   | 50 ms client tick packets                           |
-| `-Denable-diagnostics` | `true`   | Join progress and disconnect diagnostics            |
+| `-Denable-diagnostics` | `true`   | Join progress, disconnect causes, and ring pressure |
 | `-Dminecraft-version`  | `latest` | `latest` or an entry from the version catalog       |
 
 ## Run
@@ -265,6 +265,13 @@ the timer wheel or write path. Cached broadcasts and client ticks are referenced
 as immutable outbound segments instead of being copied into every client's
 private buffer. Dynamic replies retain bounded per-client storage. Client state
 is stored in structure-of-arrays columns using `std.MultiArrayList`.
+
+With diagnostics enabled, the final stats include receive-buffer exhaustion,
+completion-queue overflow and peak occupancy, the largest receive bundle,
+disconnect-cause counts, and keep-alive reply send latency. Keep-alive latency
+starts when Zion dequeues the receive batch containing the challenge; it does
+not include time the packet previously spent in the server, TCP stream, or
+kernel completion queue.
 
 ## Disclaimer
 

@@ -155,32 +155,63 @@ pub fn writeStats(writer: *Io.Writer, stats: client_table.Stats) !void {
         .{ seconds, stats.requested, stats.connected, connected_percent, stats.play, play_percent, stats.connecting, stats.waiting },
     );
 
-    if (comptime !stats_module.stats_enabled) {
+    if (comptime stats_module.stats_enabled) {
+        const packets_per_sec = @as(f64, @floatFromInt(stats.packets_received)) / rate_seconds;
+        const reconnects_per_sec = @as(f64, @floatFromInt(stats.reconnects)) / rate_seconds;
+        const rx_per_sec = @as(f64, @floatFromInt(stats.bytes_received)) / rate_seconds;
+        const tx_per_sec = @as(f64, @floatFromInt(stats.bytes_sent)) / rate_seconds;
+        try writer.print(
+            "  reconnects: total={d} avg={d:.3}/s\n" ++
+                "  packets: received={d} keepalives={d} avg={d:.2}/s\n",
+            .{ stats.reconnects, reconnects_per_sec, stats.packets_received, stats.keep_alives_answered, packets_per_sec },
+        );
+        try writer.writeAll("  traffic: rx=");
+        try writeBytes(writer, @floatFromInt(stats.bytes_received), false);
+        try writer.writeAll(" tx=");
+        try writeBytes(writer, @floatFromInt(stats.bytes_sent), false);
+        try writer.writeAll(" total=");
+        try writeBytes(writer, @floatFromInt(stats.bytes_received +| stats.bytes_sent), false);
+        try writer.writeByte('\n');
+        try writer.writeAll("  rates: rx=");
+        try writeBytes(writer, rx_per_sec, true);
+        try writer.writeAll(" tx=");
+        try writeBytes(writer, tx_per_sec, true);
+        try writer.writeByte('\n');
+    } else {
         try writer.writeAll("  counters: disabled at compile time (-Denable-stats=false)\n");
-        return;
     }
 
-    const packets_per_sec = @as(f64, @floatFromInt(stats.packets_received)) / rate_seconds;
-    const reconnects_per_sec = @as(f64, @floatFromInt(stats.reconnects)) / rate_seconds;
-    const rx_per_sec = @as(f64, @floatFromInt(stats.bytes_received)) / rate_seconds;
-    const tx_per_sec = @as(f64, @floatFromInt(stats.bytes_sent)) / rate_seconds;
-    try writer.print(
-        "  reconnects: total={d} avg={d:.3}/s\n" ++
-            "  packets: received={d} keepalives={d} avg={d:.2}/s\n",
-        .{ stats.reconnects, reconnects_per_sec, stats.packets_received, stats.keep_alives_answered, packets_per_sec },
-    );
-    try writer.writeAll("  traffic: rx=");
-    try writeBytes(writer, @floatFromInt(stats.bytes_received), false);
-    try writer.writeAll(" tx=");
-    try writeBytes(writer, @floatFromInt(stats.bytes_sent), false);
-    try writer.writeAll(" total=");
-    try writeBytes(writer, @floatFromInt(stats.bytes_received +| stats.bytes_sent), false);
-    try writer.writeByte('\n');
-    try writer.writeAll("  rates: rx=");
-    try writeBytes(writer, rx_per_sec, true);
-    try writer.writeAll(" tx=");
-    try writeBytes(writer, tx_per_sec, true);
-    try writer.writeByte('\n');
+    if (comptime stats_module.diagnostics_enabled) {
+        const diagnostics = stats.diagnostics;
+        const keep_alive_avg_ms = if (diagnostics.keep_alive_send_samples == 0)
+            0.0
+        else
+            @as(f64, @floatFromInt(diagnostics.keep_alive_send_total_ms)) /
+                @as(f64, @floatFromInt(diagnostics.keep_alive_send_samples));
+        try writer.print(
+            "  diagnostics: recv_nobufs={d} cq_overflow={d} peak_cq={d}/{d} max_recv_bundle={d}B/{d} buffers\n" ++
+                "  keepalive-send: samples={d} avg={d:.3}ms max={d}ms\n" ++
+                "  disconnects: server={d} transport={d} connect={d} buffer={d} protocol={d} resource={d} other={d}\n",
+            .{
+                diagnostics.recv_nobufs,
+                diagnostics.cq_overflow,
+                diagnostics.max_cq_ready,
+                diagnostics.max_cq_entries,
+                diagnostics.max_recv_bundle_bytes,
+                diagnostics.max_recv_bundle_buffers,
+                diagnostics.keep_alive_send_samples,
+                keep_alive_avg_ms,
+                diagnostics.keep_alive_send_max_ms,
+                diagnostics.disconnects.server,
+                diagnostics.disconnects.transport,
+                diagnostics.disconnects.connect,
+                diagnostics.disconnects.buffer_limit,
+                diagnostics.disconnects.protocol,
+                diagnostics.disconnects.resource,
+                diagnostics.disconnects.other,
+            },
+        );
+    }
 }
 
 fn writeBytes(writer: *Io.Writer, value: f64, per_second: bool) !void {
@@ -277,7 +308,7 @@ test "writeTarget formats IPv6 and Unix handshake endpoints" {
 test "writeStats includes client packet and traffic rates" {
     var buffer: [2048]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
-    try writeStats(&writer, .{
+    var stats: client_table.Stats = .{
         .requested = 100,
         .connected = 80,
         .waiting = 10,
@@ -289,7 +320,22 @@ test "writeStats includes client packet and traffic rates" {
         .bytes_received = 2048,
         .bytes_sent = 1024,
         .duration_ms = 2000,
-    });
+    };
+    if (comptime stats_module.diagnostics_enabled) {
+        stats.diagnostics = .{
+            .recv_nobufs = 3,
+            .cq_overflow = 4,
+            .max_cq_ready = 128,
+            .max_cq_entries = 512,
+            .max_recv_bundle_bytes = 8192,
+            .max_recv_bundle_buffers = 2,
+            .keep_alive_send_samples = 2,
+            .keep_alive_send_total_ms = 7,
+            .keep_alive_send_max_ms = 5,
+            .disconnects = .{ .server = 1, .transport = 2, .other = 1 },
+        };
+    }
+    try writeStats(&writer, stats);
     const output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "requested=100 connected=80 (80.0%) play=75 (75.0%)") != null);
     if (comptime stats_module.stats_enabled) {
@@ -297,6 +343,11 @@ test "writeStats includes client packet and traffic rates" {
         try std.testing.expect(std.mem.indexOf(u8, output, "traffic: rx=2.00 KiB tx=1.00 KiB total=3.00 KiB") != null);
     } else {
         try std.testing.expect(std.mem.indexOf(u8, output, "counters: disabled at compile time") != null);
+    }
+    if (comptime stats_module.diagnostics_enabled) {
+        try std.testing.expect(std.mem.indexOf(u8, output, "recv_nobufs=3 cq_overflow=4 peak_cq=128/512 max_recv_bundle=8192B/2 buffers") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "keepalive-send: samples=2 avg=3.500ms max=5ms") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "disconnects: server=1 transport=2 connect=0 buffer=0 protocol=0 resource=0 other=1") != null);
     }
 }
 

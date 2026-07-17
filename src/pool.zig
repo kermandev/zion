@@ -293,12 +293,16 @@ fn runShardLoop(
         .connect_address = connect_address,
         .connect_address_length = connect_address_length,
     };
+    if (comptime diagnostics_enabled) ctx.aggregate.diagnostics.observeCq(0, @intCast(ring.cq.cqes.len));
 
     var loop_now = now;
     while (!shouldStop()) {
         try driveDueClientsConfigured(&ctx, loop_now, progress, due_clients);
         const timeout = timeoutFromDue(scheduler.nextDeadline(), loop_now);
         try waitForUringEvents(&ring, capTimeoutForStopCheck(timeout), &stop_requested);
+        if (comptime diagnostics_enabled) {
+            ctx.aggregate.diagnostics.observeCq(ring.cq_ready(), @intCast(ring.cq.cqes.len));
+        }
         const ready = try copyReadyCqes(&ring, events, &stop_requested);
 
         loop_now = monotonicMs(io);
@@ -319,6 +323,9 @@ fn runShardLoop(
         }
     }
 
+    if (comptime diagnostics_enabled) {
+        ctx.aggregate.diagnostics.cq_overflow = @atomicLoad(u32, ring.cq.overflow, .monotonic);
+    }
     var stats = collectStats(&clients);
     if (stats_enabled) {
         stats.reconnects = ctx.aggregate.reconnects;
@@ -327,6 +334,7 @@ fn runShardLoop(
         stats.bytes_received = ctx.aggregate.bytes_received;
         stats.bytes_sent = ctx.aggregate.bytes_sent;
     }
+    if (comptime diagnostics_enabled) stats.diagnostics = ctx.aggregate.diagnostics;
     return stats;
 }
 
@@ -533,6 +541,7 @@ fn handleRecvReady(
         switch (errno) {
             .CANCELED, .NOENT => return,
             .NOBUFS => {
+                if (comptime diagnostics_enabled) ctx.aggregate.diagnostics.recv_nobufs += 1;
                 try armRecv(ctx, index);
                 return;
             },
@@ -556,6 +565,16 @@ fn handleRecvReady(
     };
     const release_batch = batch;
     defer ctx.recv_buffers.releaseBatch(release_batch);
+    if (comptime diagnostics_enabled) {
+        const batch_bytes: u64 = @intCast(event.res);
+        const batch_buffers: u32 = @intCast(std.math.divCeil(
+            usize,
+            @intCast(event.res),
+            ctx.recv_buffers.buffer_size,
+        ) catch 1);
+        ctx.aggregate.diagnostics.max_recv_bundle_bytes = @max(ctx.aggregate.diagnostics.max_recv_bundle_bytes, batch_bytes);
+        ctx.aggregate.diagnostics.max_recv_bundle_buffers = @max(ctx.aggregate.diagnostics.max_recv_bundle_buffers, batch_buffers);
+    }
 
     const phase = ctx.clients.getPhase(index);
     var read_result: client.ReadResult = .{};
@@ -571,6 +590,9 @@ fn handleRecvReady(
         read_result.effects.write_ready = read_result.effects.write_ready or part.effects.write_ready;
         read_result.effects.deadline_changed = read_result.effects.deadline_changed or part.effects.deadline_changed;
         read_result.effects.progress_changed = read_result.effects.progress_changed or part.effects.progress_changed;
+        if (comptime diagnostics_enabled) {
+            if (part.keep_alive_reply_bytes) |pending_bytes| read_result.keep_alive_reply_bytes = pending_bytes;
+        }
     }
     if (stats_enabled) {
         ctx.aggregate.bytes_received += read_result.bytes;
@@ -580,6 +602,9 @@ fn handleRecvReady(
     if (diagnostics_enabled) {
         if (read_result.last_packet_id) |id| ctx.clients.stats.slice().items(.last_packet_id)[index] = id;
         ctx.clients.stats.slice().items(.keep_alives_answered)[index] += @intCast(read_result.keep_alives);
+        if (read_result.keep_alive_reply_bytes) |pending_bytes| {
+            noteKeepAliveQueued(ctx, index, pending_bytes, now_ms);
+        }
     }
     if (read_result.effects.progress_changed) recordJoinProgress(ctx.clients, index, progress);
     if (read_result.effects.deadline_changed) scheduleClient(ctx, index);
@@ -635,6 +660,9 @@ fn handleSendReady(
         try failRuntime(ctx, index, err, now_ms, progress);
         return;
     };
+    if (comptime diagnostics_enabled) {
+        noteKeepAliveSendProgress(ctx, index, @intCast(event.res), now_ms);
+    }
     if (stats_enabled) {
         ctx.aggregate.bytes_sent += @intCast(event.res);
     }
@@ -783,6 +811,10 @@ fn finishDraining(ctx: *LoopContext, index: usize) void {
 }
 
 fn failRuntime(ctx: *LoopContext, index: usize, err: anyerror, now_ms: u64, progress: ProgressSink) !void {
+    if (comptime diagnostics_enabled) {
+        ctx.aggregate.diagnostics.disconnects.record(err);
+        clearKeepAlivePending(ctx.clients, index);
+    }
     const pool = ctx.clients.pool.slice();
     if (pool.items(.flags)[index].socket_live and !pool.items(.flags)[index].close_armed) {
         pool.items(.close_generation)[index] +%= 1;
@@ -798,6 +830,36 @@ fn failRuntime(ctx: *LoopContext, index: usize, err: anyerror, now_ms: u64, prog
     failClient(ctx.clients, index, err, now_ms, progress, ctx.target);
     if (stats_enabled) ctx.aggregate.reconnects += 1;
     scheduleClient(ctx, index);
+}
+
+fn noteKeepAliveQueued(ctx: *LoopContext, index: usize, pending_bytes: u16, now_ms: u64) void {
+    if (comptime !diagnostics_enabled) return;
+    const stats = ctx.clients.stats.slice();
+    stats.items(.keep_alive_started_ms)[index] = now_ms;
+    stats.items(.keep_alive_pending_bytes)[index] = pending_bytes;
+}
+
+fn noteKeepAliveSendProgress(ctx: *LoopContext, index: usize, sent_bytes: usize, now_ms: u64) void {
+    if (comptime !diagnostics_enabled) return;
+    const stats = ctx.clients.stats.slice();
+    const pending = stats.items(.keep_alive_pending_bytes)[index];
+    if (pending == 0) return;
+    if (sent_bytes < pending) {
+        stats.items(.keep_alive_pending_bytes)[index] = pending - @as(u16, @intCast(sent_bytes));
+        return;
+    }
+
+    const started_ms = stats.items(.keep_alive_started_ms)[index];
+    ctx.aggregate.diagnostics.recordKeepAliveSend(now_ms -| started_ms);
+    stats.items(.keep_alive_started_ms)[index] = 0;
+    stats.items(.keep_alive_pending_bytes)[index] = 0;
+}
+
+fn clearKeepAlivePending(clients: *ClientTable, index: usize) void {
+    if (comptime !diagnostics_enabled) return;
+    const stats = clients.stats.slice();
+    stats.items(.keep_alive_started_ms)[index] = 0;
+    stats.items(.keep_alive_pending_bytes)[index] = 0;
 }
 
 fn timeoutFromDue(due_optional: ?u64, now_ms: u64) i32 {

@@ -182,6 +182,7 @@ pub const SessionColumns = struct {
 pub const FrameResult = struct {
     packet_id: ?i32 = null,
     keep_alive: bool = false,
+    keep_alive_reply_bytes: if (diagnostics_enabled) ?u16 else void = if (diagnostics_enabled) null else {},
 };
 
 pub const ReadResult = struct {
@@ -189,6 +190,7 @@ pub const ReadResult = struct {
     packets: usize = 0,
     keep_alives: usize = 0,
     last_packet_id: ?i32 = null,
+    keep_alive_reply_bytes: if (diagnostics_enabled) ?u16 else void = if (diagnostics_enabled) null else {},
     effects: ReadEffects = .{},
 };
 
@@ -222,7 +224,7 @@ test "dense client metadata stays compact" {
     try std.testing.expect(@sizeOf(PoolState) <= 24);
     try std.testing.expect(@sizeOf(ReadState) <= 24);
     try std.testing.expect(@sizeOf(TimerState) <= 24);
-    try std.testing.expect(dense_table_bytes_per_client <= 140);
+    try std.testing.expect(dense_table_bytes_per_client <= if (diagnostics_enabled) 150 else 140);
 }
 
 pub const ClientTable = struct {
@@ -383,6 +385,8 @@ pub fn onConnected(clients: *ClientTable, index: usize, phase: *Phase, now_ms: u
         const client_stats = clients.stats.slice();
         client_stats.items(.last_packet_id)[index] = -1;
         client_stats.items(.keep_alives_answered)[index] = 0;
+        client_stats.items(.keep_alive_started_ms)[index] = 0;
+        client_stats.items(.keep_alive_pending_bytes)[index] = 0;
     }
     joinedLogged(clients, index).* = false;
 
@@ -441,6 +445,9 @@ pub fn onReadBytes(clients: *ClientTable, index: usize, phase: *Phase, bytes: []
         const frame_res = try handleFrame(clients, index, phase, frame.bytes, decompress_buf, decompress_window, packet_builder_buf, write_temp_buf);
         if (frame_res.packet_id) |id| result.last_packet_id = id;
         if (frame_res.keep_alive) result.keep_alives += 1;
+        if (comptime diagnostics_enabled) {
+            if (frame_res.keep_alive_reply_bytes) |pending_bytes| result.keep_alive_reply_bytes = pending_bytes;
+        }
         result.packets += 1;
         offset += frame.consumed;
     }
@@ -672,6 +679,9 @@ fn drainPackets(clients: *ClientTable, index: usize, phase: *Phase, decompress_b
             const frame_res = try handleFrame(clients, index, phase, frame.bytes, decompress_buf, decompress_window, packet_builder_buf, write_temp_buf);
             if (frame_res.packet_id) |id| result.last_packet_id = id;
             if (frame_res.keep_alive) result.keep_alives += 1;
+            if (comptime diagnostics_enabled) {
+                if (frame_res.keep_alive_reply_bytes) |pending_bytes| result.keep_alive_reply_bytes = pending_bytes;
+            }
             result.packets += 1;
             readState(clients, index).offset += @intCast(frame.consumed);
         } else {
@@ -695,7 +705,13 @@ fn handleFrame(clients: *ClientTable, index: usize, phase: *Phase, frame: []cons
     const packet = try protocol.readPacketFrame(clients.allocator, frame, compressionState(clients, index).*, if (comptime protocol.compression_enabled) decompress_buf else null, if (comptime protocol.compression_enabled) decompress_window else null);
 
     const keep_alive = try handlePacket(clients, index, phase, packet, packet_builder_buf, write_temp_buf);
-    return .{ .packet_id = packet.id, .keep_alive = keep_alive };
+    return .{
+        .packet_id = packet.id,
+        .keep_alive = keep_alive,
+        .keep_alive_reply_bytes = if (comptime diagnostics_enabled)
+            if (keep_alive) @intCast(writeState(clients, index).byteCount()) else null
+        else {},
+    };
 }
 
 fn compactReadBuffer(clients: *ClientTable, index: usize) void {
@@ -1537,6 +1553,9 @@ test "compressed play keep alive is decoded and queued" {
     try std.testing.expect(!result.effects.deadline_changed);
     try std.testing.expect(!result.effects.progress_changed);
     try std.testing.expect(wantsWrite(&test_session.clients, 0));
+    if (comptime diagnostics_enabled) {
+        try std.testing.expectEqual(@as(?u16, @intCast(writeState(&test_session.clients, 0).byteCount())), result.keep_alive_reply_bytes);
+    }
 }
 
 test "outbound buffering has one aggregate per-client limit" {
