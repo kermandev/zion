@@ -60,8 +60,10 @@ const StoredSource = enum(u8) {
 const QueueState = packed struct(u8) {
     head: u2 = 0,
     count: u3 = 0,
-    locked: bool = false,
-    padding: u2 = 0,
+    // Number of segments (from the head, in logical order) whose bytes are in
+    // flight in one gathered send. Their storage must stay stable until
+    // complete() or cancel().
+    inflight: u3 = 0,
 };
 
 pub const Queue = struct {
@@ -88,7 +90,7 @@ pub const Queue = struct {
     }
 
     pub fn isLocked(self: *const Queue) bool {
-        return self.state.locked;
+        return self.state.inflight != 0;
     }
 
     pub fn enqueueShared(self: *Queue, source: SharedSource, len: usize) error{ TooLarge, QueueFull }!void {
@@ -104,12 +106,13 @@ pub const Queue = struct {
         try self.ensureQueueCapacity(bytes.len);
 
         if (self.state.count > 0) {
-            const tail_index = self.physicalIndex(self.state.count - 1);
+            const tail_logical: u3 = self.state.count - 1;
+            const tail_index = self.physicalIndex(tail_logical);
             // Only extend storage whose live bytes still start at offset zero.
             // After a partial send, use the other owned slot so sent prefixes
             // cannot accumulate across repeated append/send cycles.
             if (self.sources[tail_index].ownedSlot()) |slot| {
-                if (self.offsets[tail_index] != 0 or (self.state.locked and tail_index == self.state.head)) {
+                if (self.offsets[tail_index] != 0 or tail_logical < self.state.inflight) {
                     // The tail cannot be extended while its storage is in flight.
                 } else {
                     try self.appendOwned(allocator, slot, bytes);
@@ -131,43 +134,67 @@ pub const Queue = struct {
     pub fn begin(self: *Queue) Pending {
         const pending = self.peek();
         if (pending == .empty) return .empty;
-        self.state.locked = true;
+        self.state.inflight = 1;
         return pending;
+    }
+
+    /// Locks every queued segment for one gathered send and fills `out` with
+    /// their pending views in FIFO order. Returns the segment count.
+    pub fn beginAll(self: *Queue, out: *[segment_capacity]Pending) u8 {
+        const count = self.state.count;
+        for (0..count) |logical| out[logical] = self.pendingAt(@intCast(logical));
+        self.state.inflight = count;
+        return count;
     }
 
     pub fn peek(self: *const Queue) Pending {
         if (self.state.count == 0) return .empty;
-        const head = self.state.head;
-        const offset = self.offsets[head];
-        const len = self.lengths[head];
-        if (self.sources[head].ownedSlot()) |slot| {
+        return self.pendingAt(0);
+    }
+
+    fn pendingAt(self: *const Queue, logical: u3) Pending {
+        const index = self.physicalIndex(logical);
+        const offset = self.offsets[index];
+        const len = self.lengths[index];
+        if (self.sources[index].ownedSlot()) |slot| {
             return .{ .owned = self.owned_buffers[slot].?[offset..len] };
         }
         return .{ .shared = .{
-            .source = self.sources[head].sharedSource().?,
+            .source = self.sources[index].sharedSource().?,
             .offset = offset,
             .len = len,
         } };
     }
 
     pub fn cancel(self: *Queue) void {
-        self.state.locked = false;
+        self.state.inflight = 0;
     }
 
     pub fn complete(self: *Queue, count: usize) error{InvalidCompletion}!void {
-        if (!self.state.locked or self.state.count == 0 or count == 0) return error.InvalidCompletion;
-        const head = self.state.head;
-        const remaining = self.lengths[head] - self.offsets[head];
-        if (count > remaining) return error.InvalidCompletion;
+        const inflight = self.state.inflight;
+        if (inflight == 0 or self.state.count == 0 or count == 0) return error.InvalidCompletion;
+        var in_flight_bytes: usize = 0;
+        for (0..inflight) |logical| {
+            const index = self.physicalIndex(@intCast(logical));
+            in_flight_bytes += self.lengths[index] - self.offsets[index];
+        }
+        if (count > in_flight_bytes) return error.InvalidCompletion;
 
-        self.offsets[head] += @intCast(count);
         self.queued_bytes -= @intCast(count);
-        self.state.locked = false;
-        if (self.offsets[head] != self.lengths[head]) return;
-
-        if (self.sources[head].ownedSlot()) |slot| self.owned_lens[slot] = 0;
-        self.state.head = @intCast((@as(usize, head) + 1) % segment_capacity);
-        self.state.count -= 1;
+        self.state.inflight = 0;
+        var left = count;
+        while (left > 0) {
+            const head = self.state.head;
+            const remaining = self.lengths[head] - self.offsets[head];
+            if (left < remaining) {
+                self.offsets[head] += @intCast(left);
+                break;
+            }
+            left -= remaining;
+            if (self.sources[head].ownedSlot()) |slot| self.owned_lens[slot] = 0;
+            self.state.head = @intCast((@as(usize, head) + 1) % segment_capacity);
+            self.state.count -= 1;
+        }
         if (self.state.count == 0) self.state.head = 0;
     }
 
@@ -178,24 +205,37 @@ pub const Queue = struct {
     }
 
     pub fn reset(self: *Queue, allocator: std.mem.Allocator, preserve_inflight: bool) void {
-        if (preserve_inflight and self.state.locked and self.state.count > 0) {
-            const head = self.state.head;
-            const preserved_source = self.sources[head];
-            const preserved_offset = self.offsets[head];
-            const preserved_len = self.lengths[head];
-            const preserved_owned = preserved_source.ownedSlot();
+        const inflight = self.state.inflight;
+        if (preserve_inflight and inflight > 0 and self.state.count > 0) {
+            // Keep every in-flight segment: the kernel may still read any of
+            // their bytes until the gathered send completes.
+            var preserved_owned = [2]bool{ false, false };
+            var sources: [segment_capacity]StoredSource = undefined;
+            var offsets: [segment_capacity]u16 = undefined;
+            var lengths: [segment_capacity]u16 = undefined;
+            var preserved_bytes: usize = 0;
+            for (0..inflight) |logical| {
+                const index = self.physicalIndex(@intCast(logical));
+                sources[logical] = self.sources[index];
+                offsets[logical] = self.offsets[index];
+                lengths[logical] = self.lengths[index];
+                if (self.sources[index].ownedSlot()) |slot| preserved_owned[slot] = true;
+                preserved_bytes += self.lengths[index] - self.offsets[index];
+            }
             for (&self.owned_buffers, 0..) |*buffer, slot| {
-                if (preserved_owned != null and preserved_owned.? == slot) continue;
+                if (preserved_owned[slot]) continue;
                 if (buffer.*) |bytes| allocator.free(bytes[0..self.owned_capacities[slot]]);
                 buffer.* = null;
                 self.owned_capacities[slot] = 0;
                 self.owned_lens[slot] = 0;
             }
-            self.sources[0] = preserved_source;
-            self.offsets[0] = preserved_offset;
-            self.lengths[0] = preserved_len;
-            self.state = .{ .count = 1, .locked = true };
-            self.queued_bytes = preserved_len - preserved_offset;
+            for (0..inflight) |logical| {
+                self.sources[logical] = sources[logical];
+                self.offsets[logical] = offsets[logical];
+                self.lengths[logical] = lengths[logical];
+            }
+            self.state = .{ .count = inflight, .inflight = inflight };
+            self.queued_bytes = @intCast(preserved_bytes);
             return;
         }
 
@@ -347,6 +387,130 @@ test "reset can preserve only the in-flight head" {
     try std.testing.expect(queue.begin() == .empty);
 }
 
+test "gathered begin locks every segment and completes them in one call" {
+    var queue: Queue = .{};
+    defer queue.deinit(std.testing.allocator);
+
+    try queue.enqueueOwned(std.testing.allocator, "reply");
+    try queue.enqueueShared(.client_tick_plain, 3);
+    try queue.enqueueShared(.broadcast_plain, 7);
+
+    var pendings: [segment_capacity]Pending = undefined;
+    try std.testing.expectEqual(@as(u8, 3), queue.beginAll(&pendings));
+    try std.testing.expect(queue.isLocked());
+    try std.testing.expectEqualStrings("reply", pendings[0].owned);
+    try std.testing.expectEqual(SharedSource.client_tick_plain, pendings[1].shared.source);
+    try std.testing.expectEqual(SharedSource.broadcast_plain, pendings[2].shared.source);
+
+    // In-flight segments never grow, so a new append lands in a new segment.
+    try queue.enqueueOwned(std.testing.allocator, "x");
+    try std.testing.expectEqual(@as(u8, 4), queue.segmentCount());
+
+    try queue.complete(5 + 3 + 7);
+    try std.testing.expectEqual(@as(u8, 1), queue.segmentCount());
+    try std.testing.expectEqual(@as(usize, 1), queue.byteCount());
+    try std.testing.expect(!queue.isLocked());
+    try std.testing.expectEqualStrings("x", queue.begin().owned);
+}
+
+test "gathered completion resumes mid-segment after a short send" {
+    var queue: Queue = .{};
+    defer queue.deinit(std.testing.allocator);
+
+    try queue.enqueueOwned(std.testing.allocator, "abcd");
+    try queue.enqueueShared(.broadcast_plain, 6);
+
+    var pendings: [segment_capacity]Pending = undefined;
+    try std.testing.expectEqual(@as(u8, 2), queue.beginAll(&pendings));
+    // 4 owned bytes plus 2 of the shared frame.
+    try queue.complete(6);
+
+    try std.testing.expectEqual(@as(u8, 1), queue.segmentCount());
+    try std.testing.expectEqual(@as(usize, 4), queue.byteCount());
+    const head = queue.peek();
+    try std.testing.expectEqual(@as(u32, 2), head.shared.offset);
+    try std.testing.expectEqual(@as(u32, 6), head.shared.len);
+
+    // Overcompleting the remaining bytes is rejected.
+    _ = queue.beginAll(&pendings);
+    try std.testing.expectError(error.InvalidCompletion, queue.complete(5));
+    try queue.complete(4);
+    try std.testing.expect(queue.begin() == .empty);
+}
+
+test "gathered completion allows appending a new segment while in flight" {
+    var queue: Queue = .{};
+    defer queue.deinit(std.testing.allocator);
+
+    try queue.enqueueOwned(std.testing.allocator, "first");
+    var pendings: [segment_capacity]Pending = undefined;
+    try std.testing.expectEqual(@as(u8, 1), queue.beginAll(&pendings));
+
+    // The in-flight tail cannot be extended, but a fresh segment can queue.
+    try queue.enqueueOwned(std.testing.allocator, "second");
+    try std.testing.expectEqual(@as(u8, 2), queue.segmentCount());
+
+    try queue.complete(5);
+    try std.testing.expectEqual(@as(u8, 1), queue.beginAll(&pendings));
+    try std.testing.expectEqualStrings("second", pendings[0].owned);
+}
+
+test "reset preserves every in-flight segment of a gathered send" {
+    var queue: Queue = .{};
+    defer queue.deinit(std.testing.allocator);
+
+    try queue.enqueueOwned(std.testing.allocator, "inflight");
+    try queue.enqueueShared(.client_tick_plain, 4);
+    var pendings: [segment_capacity]Pending = undefined;
+    try std.testing.expectEqual(@as(u8, 2), queue.beginAll(&pendings));
+    queue.reset(std.testing.allocator, true);
+
+    try std.testing.expectEqual(@as(u8, 2), queue.segmentCount());
+    try std.testing.expect(queue.isLocked());
+    try std.testing.expectEqual(@as(usize, 12), queue.byteCount());
+    try queue.complete(12);
+    try std.testing.expect(queue.begin() == .empty);
+}
+
+test "randomized gathered-send state transitions preserve queue invariants" {
+    var queue: Queue = .{};
+    defer queue.deinit(std.testing.allocator);
+
+    var rng: u64 = 0x2545_f491_4f6c_dd1d;
+    for (0..50_000) |_| {
+        rng = rng *% 6364136223846793005 +% 1442695040888963407;
+        const operation: u8 = @truncate(rng >> 33);
+        const argument: u8 = @truncate(rng >> 41);
+        switch (operation % 8) {
+            0 => {
+                var bytes: [64]u8 = undefined;
+                const len: usize = argument % bytes.len + 1;
+                for (bytes[0..len], 0..) |*byte, byte_index| byte.* = @truncate(byte_index + argument);
+                queue.enqueueOwned(std.testing.allocator, bytes[0..len]) catch |err| switch (err) {
+                    error.QueueFull, error.NoOwnedBuffer, error.TooLarge => {},
+                    else => return err,
+                };
+            },
+            1 => queue.enqueueShared(@enumFromInt(argument % @typeInfo(SharedSource).@"enum".field_names.len), @as(usize, argument) + 1) catch |err| switch (err) {
+                error.QueueFull, error.TooLarge => {},
+            },
+            2 => _ = queue.begin(),
+            3 => {
+                var pendings: [segment_capacity]Pending = undefined;
+                _ = queue.beginAll(&pendings);
+            },
+            4 => queue.complete(@as(usize, argument) + 1) catch |err| switch (err) {
+                error.InvalidCompletion => {},
+            },
+            5 => queue.cancel(),
+            6 => queue.reset(std.testing.allocator, argument & 1 != 0),
+            7 => queue.clearRetainingCapacity(),
+            else => unreachable,
+        }
+        try validateQueueInvariants(&queue);
+    }
+}
+
 test "fuzz outbound queue state transitions" {
     try std.testing.fuzz({}, fuzzQueueStateTransitions, .{ .corpus = &.{
         "\x08\x00\x00\x00\x00\x03\x02\x05\x04\x01\x03\x07",
@@ -364,7 +528,7 @@ fn fuzzQueueStateTransitions(_: void, smith: *std.testing.Smith) anyerror!void {
     while (index < operation_count) : (index += 1) {
         const operation = operations[index];
         const argument = if (index + 1 < operation_count) operations[index + 1] else operation;
-        switch (operation % 7) {
+        switch (operation % 8) {
             0 => {
                 var bytes: [64]u8 = undefined;
                 const len: usize = argument % bytes.len + 1;
@@ -384,6 +548,10 @@ fn fuzzQueueStateTransitions(_: void, smith: *std.testing.Smith) anyerror!void {
             4 => queue.cancel(),
             5 => queue.reset(std.testing.allocator, argument & 1 != 0),
             6 => queue.clearRetainingCapacity(),
+            7 => {
+                var pendings: [segment_capacity]Pending = undefined;
+                _ = queue.beginAll(&pendings);
+            },
             else => unreachable,
         }
         try validateQueueInvariants(&queue);
@@ -392,7 +560,7 @@ fn fuzzQueueStateTransitions(_: void, smith: *std.testing.Smith) anyerror!void {
 
 fn validateQueueInvariants(queue: *const Queue) !void {
     try std.testing.expect(queue.state.count <= segment_capacity);
-    try std.testing.expect(!queue.state.locked or queue.state.count > 0);
+    try std.testing.expect(queue.state.inflight <= queue.state.count);
     if (queue.state.count == 0) try std.testing.expectEqual(@as(u2, 0), queue.state.head);
 
     var queued_bytes: usize = 0;

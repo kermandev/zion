@@ -85,13 +85,20 @@ pub const JoinProgress = struct {
     }
 };
 
+// Aligning the first field to a cache line raises the whole struct's alignment,
+// so each element of a `[]ShardProgress` is padded to its own line and adjacent
+// shards never share one and false-share.
 pub const ShardProgress = struct {
-    joined: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    joined: std.atomic.Value(usize) align(std.atomic.cache_line) = std.atomic.Value(usize).init(0),
     active: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     disconnects: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     reconnects: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    padding: [31]u8 = @splat(0),
+
+    comptime {
+        std.debug.assert(@alignOf(ShardProgress) == std.atomic.cache_line);
+        std.debug.assert(@sizeOf(ShardProgress) % std.atomic.cache_line == 0);
+    }
 };
 
 pub const ProgressSink = union(enum) {

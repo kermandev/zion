@@ -146,7 +146,7 @@ pub const PacketFrame = struct {
         const allocator = frame.buffer.allocator;
         var out: Io.Writer.Allocating = .init(allocator);
         errdefer out.deinit();
-        try appendPacketFrame(allocator, &out, frame.packetData(), compression);
+        try appendPacketFrame(allocator, &out, frame.packetData(), compression, null, null);
         return try out.toOwnedSlice();
     }
 
@@ -160,6 +160,8 @@ pub fn appendPacketFrame(
     out: anytype,
     packet_data: []const u8,
     compression: Compression,
+    compress_buf: ?*std.ArrayList(u8),
+    compress_window: ?[]u8,
 ) PacketError!void {
     var packet = PacketWriter(@TypeOf(out.*)).init(out);
     if (packet_data.len > max_packet_len) return error.PacketTooLarge;
@@ -180,13 +182,22 @@ pub fn appendPacketFrame(
         return;
     }
 
-    const compressed = try compressPacket(allocator, packet_data);
-    defer allocator.free(compressed);
+    var local_buf: std.ArrayList(u8) = .empty;
+    defer local_buf.deinit(allocator);
+    const buf = compress_buf orelse &local_buf;
+
+    const owned_window: ?[]u8 = if (compress_window == null)
+        try allocator.alloc(u8, std.compress.flate.max_window_len)
+    else
+        null;
+    defer if (owned_window) |window| allocator.free(window);
+
+    try compressPacketInto(allocator, buf, packet_data, compress_window orelse owned_window.?);
 
     const data_len_len = varIntLen(@intCast(packet_data.len));
-    try packet.writeVarInt(@intCast(data_len_len + compressed.len));
+    try packet.writeVarInt(@intCast(data_len_len + buf.items.len));
     try packet.writeVarInt(@intCast(packet_data.len));
-    try packet.writeBytes(compressed);
+    try packet.writeBytes(buf.items);
 }
 
 pub const PacketReader = struct {
@@ -241,6 +252,10 @@ pub const PacketReader = struct {
         const len = try self.readVarInt();
         if (len < 0) return error.NegativeLength;
         const usize_len: usize = @intCast(len);
+        // Vanilla bounds serverbound strings at max_chars * 3 (UTF-16 code
+        // units, 3 bytes each). We count codepoints instead, so use the UTF-8
+        // worst case of 4 bytes per codepoint to avoid rejecting strings that
+        // pass the codepoint check below.
         if (usize_len > max_chars * 4) return error.StringTooLong;
         const out = try self.reader.take(usize_len);
         const chars = std.unicode.utf8CountCodepoints(out) catch return error.MalformedPacket;
@@ -283,7 +298,7 @@ pub fn readPacketFrame(
     }
 }
 
-fn packetFromPayload(payload: []const u8) PacketError!Packet {
+pub fn packetFromPayload(payload: []const u8) PacketError!Packet {
     var payload_reader: Io.Reader = .fixed(payload);
     var packet_reader = PacketReader.init(&payload_reader);
     const id = try packet_reader.readVarInt();
@@ -293,11 +308,75 @@ fn packetFromPayload(payload: []const u8) PacketError!Packet {
     };
 }
 
-pub fn peekCompressedPacketId(compressed: []const u8, window: []u8) PacketError!i32 {
+/// Decodes just the packet id from a (possibly partial) compressed frame body
+/// without fully decompressing it. Returns null when more bytes are needed to
+/// decide; malformed data is rejected even when the frame is still incomplete.
+pub fn peekCompressedPacketId(compressed: []const u8, window: []u8) PacketError!?i32 {
+    if (compressed.len < 2) return null;
+    try validateZlibHeader(compressed);
     var input: Io.Reader = .fixed(compressed);
     var decompress: std.compress.flate.Decompress = .init(&input, .zlib, window);
     var packet_reader = PacketReader.init(&decompress.reader);
-    return packet_reader.readVarInt();
+    return packet_reader.readVarInt() catch |err| switch (err) {
+        // Decompress surfaces truncated input as ReadFailed with its err field
+        // set to EndOfStream: more frame bytes are needed, not corruption.
+        error.ReadFailed => {
+            const cause = decompress.err orelse return error.MalformedPacket;
+            return if (cause == error.EndOfStream) null else error.MalformedPacket;
+        },
+        error.EndOfStream => error.MalformedPacket,
+        error.VarIntTooLong => error.VarIntTooLong,
+    };
+}
+
+/// Reads a complete compressed frame body (the bytes after the data length
+/// prefix), decompressing at most once. The packet id is decoded directly off
+/// the stream; when `isHandled` rejects it, decompression stops early and null
+/// is returned. Otherwise the payload is decompressed into decomp_buf.
+pub fn readCompressedPacket(
+    allocator: std.mem.Allocator,
+    compressed: []const u8,
+    data_len: usize,
+    decomp_buf: *std.ArrayList(u8),
+    window: []u8,
+    comptime isHandled: fn (i32) bool,
+) PacketError!?Packet {
+    if (comptime !compression_enabled) unreachable;
+    std.debug.assert(data_len > 0 and data_len <= max_packet_len);
+    try validateZlibHeader(compressed);
+
+    var input: Io.Reader = .fixed(compressed);
+    var decompress: std.compress.flate.Decompress = .init(&input, .zlib, window);
+
+    // Decode the id VarInt off the decompressed stream, tracking how many
+    // bytes it actually occupied (it may be non-canonically encoded).
+    var unsigned: u32 = 0;
+    var id_len: usize = 0;
+    var shift: u5 = 0;
+    while (true) {
+        const byte = decompress.reader.takeByte() catch return error.MalformedPacket;
+        unsigned |= @as(u32, byte & 0x7f) << shift;
+        id_len += 1;
+        if ((byte & 0x80) == 0) break;
+        if (id_len == 5) return error.VarIntTooLong;
+        shift += 7;
+    }
+    const id: i32 = @bitCast(unsigned);
+    if (!isHandled(id)) return null;
+
+    if (data_len < id_len) return error.MalformedPacket;
+    const payload_len = data_len - id_len;
+    try decomp_buf.resize(allocator, payload_len);
+    var fixed: Io.Writer = .fixed(decomp_buf.items);
+    decompress.reader.streamExact(&fixed, payload_len) catch return error.MalformedPacket;
+
+    var discard_buffer: [1024]u8 = undefined;
+    var discard: Io.Writer.Discarding = .init(&discard_buffer);
+    const extra = decompress.reader.streamRemaining(&discard.writer) catch return error.MalformedPacket;
+    if (extra != 0) return error.MalformedPacket;
+    if (input.seek != input.end) return error.MalformedPacket;
+
+    return .{ .id = id, .payload = decomp_buf.items };
 }
 
 pub const Compression = if (compression_enabled) union(enum) {
@@ -377,19 +456,21 @@ fn validateZlibHeader(compressed: []const u8) PacketError!void {
     if (has_preset_dictionary) return error.MalformedPacket;
 }
 
-fn compressPacket(allocator: std.mem.Allocator, plain: []const u8) PacketError![]u8 {
+fn compressPacketInto(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    plain: []const u8,
+    window: []u8,
+) PacketError!void {
+    buf.clearRetainingCapacity();
     const out_bound = plain.len + plain.len / 16_383 * 5 + 64;
-    var output = try Io.Writer.Allocating.initCapacity(allocator, out_bound);
-    errdefer output.deinit();
-
-    const window = try allocator.alloc(u8, std.compress.flate.max_window_len);
-    defer allocator.free(window);
+    try buf.ensureTotalCapacity(allocator, out_bound);
+    var output: Io.Writer.Allocating = .fromArrayList(allocator, buf);
+    defer buf.* = output.toArrayList();
 
     var compress = try std.compress.flate.Compress.init(&output.writer, window, .zlib, .fastest);
     try compress.writer.writeAll(plain);
     try compress.finish();
-
-    return try output.toOwnedSlice();
 }
 
 test "varint round trips protocol values" {
@@ -451,9 +532,119 @@ test "appendPacketFrame frames cached packet bodies like PacketFrame" {
 
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try appendPacketFrame(std.testing.allocator, &out, frame_builder.packetData(), .disabled);
+    try appendPacketFrame(std.testing.allocator, &out, frame_builder.packetData(), .disabled, null, null);
 
     try std.testing.expectEqualSlices(u8, frame, out.written());
+}
+
+test "appendPacketFrame reuses caller-provided compression scratch" {
+    if (comptime !compression_enabled) {
+        return error.SkipZigTest;
+    } else {
+        const allocator = std.testing.allocator;
+        var buffer: Io.Writer.Allocating = .init(allocator);
+        defer buffer.deinit();
+        var frame_builder = try PacketFrame.init(&buffer, 0x2b);
+        var payload: [1024]u8 = undefined;
+        var random: u32 = 0x1234_5678;
+        for (&payload) |*byte| {
+            random = random *% 1_664_525 +% 1_013_904_223;
+            byte.* = @truncate(random >> 16);
+        }
+        try frame_builder.writer.writeBytes(&payload);
+
+        var fresh: Io.Writer.Allocating = .init(allocator);
+        defer fresh.deinit();
+        try appendPacketFrame(allocator, &fresh, frame_builder.packetData(), .{ .enabled = 0 }, null, null);
+
+        var scratch_buf: std.ArrayList(u8) = .empty;
+        defer scratch_buf.deinit(allocator);
+        const scratch_window = try allocator.alloc(u8, std.compress.flate.max_window_len);
+        defer allocator.free(scratch_window);
+
+        var reused: Io.Writer.Allocating = .init(allocator);
+        defer reused.deinit();
+        for (0..2) |_| {
+            reused.clearRetainingCapacity();
+            try appendPacketFrame(allocator, &reused, frame_builder.packetData(), .{ .enabled = 0 }, &scratch_buf, scratch_window);
+            try std.testing.expectEqualSlices(u8, fresh.written(), reused.written());
+        }
+    }
+}
+
+test "peekCompressedPacketId validates headers and tolerates truncation" {
+    if (comptime !compression_enabled) {
+        return error.SkipZigTest;
+    } else {
+        const allocator = std.testing.allocator;
+        var buffer: Io.Writer.Allocating = .init(allocator);
+        defer buffer.deinit();
+        var frame_builder = try PacketFrame.init(&buffer, 0x2b);
+        try frame_builder.writer.writeI64(42);
+
+        const frame = try frame_builder.finish(.{ .enabled = 0 });
+        defer allocator.free(frame);
+
+        var frame_reader: Io.Reader = .fixed(frame);
+        var packet_reader = PacketReader.init(&frame_reader);
+        _ = try packet_reader.readVarInt();
+        _ = try packet_reader.readVarInt();
+        const compressed = frame[frame_reader.seek..];
+
+        const window = try allocator.alloc(u8, std.compress.flate.max_window_len);
+        defer allocator.free(window);
+
+        try std.testing.expectEqual(@as(?i32, 0x2b), try peekCompressedPacketId(compressed, window));
+        // A single byte cannot even hold the zlib header yet.
+        try std.testing.expectEqual(@as(?i32, null), try peekCompressedPacketId(compressed[0..1], window));
+        // A malformed zlib header is rejected even while incomplete.
+        try std.testing.expectError(error.MalformedPacket, peekCompressedPacketId(&.{ 0x78, 0x00 }, window));
+    }
+}
+
+test "readCompressedPacket decompresses handled packets exactly once and skips others" {
+    if (comptime !compression_enabled) {
+        return error.SkipZigTest;
+    } else {
+        const allocator = std.testing.allocator;
+        var buffer: Io.Writer.Allocating = .init(allocator);
+        defer buffer.deinit();
+        var frame_builder = try PacketFrame.init(&buffer, 0x2b);
+        try frame_builder.writer.writeI64(42);
+        const data_len = frame_builder.packetData().len;
+
+        const frame = try frame_builder.finish(.{ .enabled = 0 });
+        defer allocator.free(frame);
+
+        var frame_reader: Io.Reader = .fixed(frame);
+        var packet_reader = PacketReader.init(&frame_reader);
+        _ = try packet_reader.readVarInt();
+        _ = try packet_reader.readVarInt();
+        const compressed = frame[frame_reader.seek..];
+
+        const window = try allocator.alloc(u8, std.compress.flate.max_window_len);
+        defer allocator.free(window);
+        var decomp_buf: std.ArrayList(u8) = .empty;
+        defer decomp_buf.deinit(allocator);
+
+        const handled = struct {
+            fn accept(_: i32) bool {
+                return true;
+            }
+            fn reject(_: i32) bool {
+                return false;
+            }
+        };
+
+        const packet = (try readCompressedPacket(allocator, compressed, data_len, &decomp_buf, window, handled.accept)).?;
+        try std.testing.expectEqual(@as(i32, 0x2b), packet.id);
+        try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 42 }, packet.payload);
+
+        try std.testing.expectEqual(@as(?Packet, null), try readCompressedPacket(allocator, compressed, data_len, &decomp_buf, window, handled.reject));
+
+        // A declared length that disagrees with the stream is malformed.
+        try std.testing.expectError(error.MalformedPacket, readCompressedPacket(allocator, compressed, data_len - 1, &decomp_buf, window, handled.accept));
+    }
 }
 
 test "readPacketFrame borrows uncompressed payload bytes" {

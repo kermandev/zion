@@ -12,6 +12,10 @@ if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" != "v$version" ]
 fi
 
 source_date_epoch="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}"
+if [[ -z "$source_date_epoch" ]]; then
+    echo "error: could not determine SOURCE_DATE_EPOCH (git log produced no commit timestamp)" >&2
+    exit 1
+fi
 release_jobs="${ZION_RELEASE_JOBS:-1}"
 if [[ ! "$release_jobs" =~ ^[1-9][0-9]*$ ]]; then
     echo "error: ZION_RELEASE_JOBS must be a positive integer" >&2
@@ -41,10 +45,20 @@ fi
 rm -rf dist .zig-cache/release
 mkdir -p dist
 
-mapfile -t minecraft_versions < <(zig run \
+# Capture the version list via a temp file so a partial-output failure of
+# `zig run` is caught; a process substitution's exit status is invisible to
+# `set -e`.
+minecraft_versions_file="$(mktemp)"
+trap 'rm -f "$minecraft_versions_file"' EXIT
+if ! zig run \
     --dep minecraft_version_catalog \
     -Mroot=scripts/minecraft_versions.zig \
-    -Mminecraft_version_catalog=src/protocol/versions/catalog.zig)
+    -Mminecraft_version_catalog=src/protocol/versions/catalog.zig \
+    > "$minecraft_versions_file"; then
+    echo "error: failed to enumerate the Minecraft version catalog" >&2
+    exit 1
+fi
+mapfile -t minecraft_versions < "$minecraft_versions_file"
 if [[ ${#minecraft_versions[@]} -eq 0 ]]; then
     echo "error: Minecraft version catalog is empty" >&2
     exit 1
@@ -84,31 +98,34 @@ build_archive() {
     rm -rf "dist/$name"
 }
 
-wait_for_batch() {
-    local failed=0
-    local pid
-    for pid in "$@"; do
-        if ! wait "$pid"; then
-            failed=1
-        fi
-    done
-    return "$failed"
-}
-
-pids=()
+# Rolling job pool: reap one finished build (wait -n) before starting the
+# next, so one slow target never stalls otherwise-idle job slots.
+build_failed=0
+active_jobs=0
 for minecraft_version in "${minecraft_versions[@]}"; do
     for index in "${platform_indices[@]}"; do
         for variant in "${variants[@]}"; do
             build_archive "$minecraft_version" "$index" "$variant" &
-            pids+=("$!")
-            if (( ${#pids[@]} == release_jobs )); then
-                wait_for_batch "${pids[@]}"
-                pids=()
+            active_jobs=$((active_jobs + 1))
+            if (( active_jobs >= release_jobs )); then
+                if ! wait -n; then
+                    build_failed=1
+                fi
+                active_jobs=$((active_jobs - 1))
             fi
         done
     done
 done
-wait_for_batch "${pids[@]}"
+while (( active_jobs > 0 )); do
+    if ! wait -n; then
+        build_failed=1
+    fi
+    active_jobs=$((active_jobs - 1))
+done
+if (( build_failed )); then
+    echo "error: one or more release builds failed" >&2
+    exit 1
+fi
 
 (
     cd dist

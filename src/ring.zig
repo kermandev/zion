@@ -33,6 +33,7 @@ pub const CompletionKind = enum(u8) {
     socket = 5,
     socket_option = 6,
     close = 7,
+    poll = 8,
 };
 
 pub const CompletionKey = struct {
@@ -60,11 +61,29 @@ pub fn unpackCompletionKey(value: u64) ?CompletionKey {
 
 pub fn openUring(client_count: usize) !IoUring {
     const entries = ioUringEntries(client_count);
-    const base_flags = linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER;
-    return IoUring.init(entries, base_flags | linux.IORING_SETUP_DEFER_TASKRUN) catch |err| switch (err) {
-        error.ArgumentsInvalid => IoUring.init(entries, base_flags),
+    // Multishot recv can complete in bursts far beyond the default 2x CQ; a 4x
+    // CQ absorbs them without overflow (the kernel caps CQ size at 2x its
+    // maximum SQ size, so clamp accordingly).
+    const cq_entries: u32 = @intCast(@min(@as(u32, entries) *| 4, 2 * @as(u32, max_ring_entries)));
+    const base_flags = linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_CQSIZE;
+    var ring = initWithCqSize(entries, base_flags | linux.IORING_SETUP_DEFER_TASKRUN, cq_entries) catch |err| switch (err) {
+        error.ArgumentsInvalid => try initWithCqSize(entries, base_flags, cq_entries),
         else => return err,
     };
+    errdefer ring.deinit();
+    // Timed waits rely on IORING_ENTER_EXT_ARG unconditionally; the feature
+    // exists since kernel 5.11, far below the documented 6.7 kernel floor.
+    if ((ring.features & IORING_FEAT_EXT_ARG) == 0) return error.IoUringExtArgUnsupported;
+    return ring;
+}
+
+fn initWithCqSize(entries: u16, flags: u32, cq_entries: u32) !IoUring {
+    var params = std.mem.zeroInit(linux.io_uring_params, .{
+        .flags = flags,
+        .sq_thread_idle = 1000,
+        .cq_entries = cq_entries,
+    });
+    return IoUring.init_params(entries, &params);
 }
 
 pub fn ioUringEntries(client_count: usize) u16 {
@@ -113,7 +132,9 @@ pub const RecvBatch = struct {
     buffer_count: u16,
 
     pub fn init(start_id: u16, total_len: usize, buffer_size: u32, buffer_count: u16) error{InvalidBatch}!RecvBatch {
-        if (buffer_size == 0 or buffer_count == 0 or start_id >= buffer_count or total_len == 0) return error.InvalidBatch;
+        // Power-of-two counts (guaranteed by boundedPowerOfTwo) let next() wrap
+        // with a mask; a runtime `%` would emit a hardware divide per slice.
+        if (buffer_size == 0 or !std.math.isPowerOfTwo(buffer_count) or start_id >= buffer_count or total_len == 0) return error.InvalidBatch;
         if (total_len > @as(usize, buffer_size) * buffer_count) return error.InvalidBatch;
         return .{
             .next_id = start_id,
@@ -128,7 +149,7 @@ pub const RecvBatch = struct {
         const len = @min(self.remaining, self.buffer_size);
         const result: RecvSlice = .{ .buffer_id = self.next_id, .len = len };
         self.remaining -= len;
-        self.next_id = @intCast((@as(usize, self.next_id) + 1) % self.buffer_count);
+        self.next_id = (self.next_id + 1) & (self.buffer_count - 1);
         return result;
     }
 };
@@ -193,11 +214,13 @@ pub const RecvBufferGroup = struct {
     pub fn releaseBatch(self: *RecvBufferGroup, batch_value: RecvBatch) void {
         var iterator = batch_value;
         const mask = IoUring.buf_ring_mask(self.buffer_count);
+        var released: u16 = 0;
         while (iterator.next()) |slice| {
             const start = @as(usize, self.buffer_size) * slice.buffer_id;
-            IoUring.buf_ring_add(self.br, self.buffers[start .. start + self.buffer_size], slice.buffer_id, mask, 0);
-            IoUring.buf_ring_advance(self.br, 1);
+            IoUring.buf_ring_add(self.br, self.buffers[start .. start + self.buffer_size], slice.buffer_id, mask, released);
+            released += 1;
         }
+        if (released > 0) IoUring.buf_ring_advance(self.br, released);
     }
 };
 
@@ -223,28 +246,14 @@ fn retryUring(should_stop: *const std.atomic.Value(bool), ring: *IoUring, compti
 }
 
 pub fn waitForUringEvents(ring: *IoUring, timeout_ms: i32, should_stop: *const std.atomic.Value(bool)) !void {
-    if (ring.cq_ready() > 0) {
-        if (timeout_ms > 0 and (ring.features & IORING_FEAT_EXT_ARG) != 0 and (ring.features & IORING_FEAT_MIN_TIMEOUT) != 0) {
-            try submitAndWaitTimed(ring, timeout_ms, true, should_stop);
-        } else {
-            try submitAndRunTaskWork(ring, should_stop);
-        }
-        return;
-    }
-
-    if (timeout_ms <= 0) {
+    // Ready completions are drained immediately; the 50us min-timeout batching
+    // only applies while idle, as a wakeup coalescing window. EXT_ARG support
+    // is guaranteed by openUring.
+    if (ring.cq_ready() > 0 or timeout_ms <= 0) {
         try submitAndRunTaskWork(ring, should_stop);
         return;
     }
-
-    if ((ring.features & IORING_FEAT_EXT_ARG) != 0) {
-        try submitAndWaitTimed(ring, timeout_ms, false, should_stop);
-        return;
-    }
-
-    var timeout = timeoutTimespec(timeout_ms);
-    try queueTimeout(ring, packCompletionKey(.{ .kind = .timeout, .generation = 0, .index = 0 }), &timeout);
-    _ = try retryUring(should_stop, ring, .submit_and_wait);
+    try submitAndWaitTimed(ring, timeout_ms, true, should_stop);
 }
 
 fn submitAndRunTaskWork(ring: *IoUring, should_stop: *const std.atomic.Value(bool)) !void {
@@ -311,9 +320,10 @@ pub fn registerFixedFiles(ring: *IoUring, count: usize) !void {
     try ring.register_files_sparse(@intCast(count));
 }
 
-pub fn queueTimeout(ring: *IoUring, user_data: u64, timeout: *const linux.kernel_timespec) !void {
+pub fn queuePollOut(ring: *IoUring, user_data: u64, slot: u32) !void {
     try ensureSqeCapacity(ring, 1);
-    _ = try ring.timeout(user_data, timeout, 1, 0);
+    const sqe = try ring.poll_add(user_data, @intCast(slot), linux.POLL.OUT);
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
 pub fn queueSocketDirect(ring: *IoUring, user_data: u64, slot: u32, family: u32, protocol: u32) !void {
@@ -340,9 +350,13 @@ pub fn queueConfigureAndConnectFixed(
     address: *const posix.sockaddr,
     address_len: posix.socklen_t,
 ) !void {
-    try ensureSqeCapacity(ring, if (tcp) 4 else 3);
-    try queueFixedSocketOption(ring, option_user_data, slot, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(receive_buffer_bytes));
-    try queueFixedSocketOption(ring, option_user_data, slot, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(send_buffer_bytes));
+    // Non-positive buffer sizes leave the socket on kernel autotuning.
+    const set_rcvbuf = receive_buffer_bytes.* > 0;
+    const set_sndbuf = send_buffer_bytes.* > 0;
+    const option_count: u32 = 1 + @intFromBool(set_rcvbuf) + @intFromBool(set_sndbuf) + @intFromBool(tcp);
+    try ensureSqeCapacity(ring, option_count);
+    if (set_rcvbuf) try queueFixedSocketOption(ring, option_user_data, slot, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(receive_buffer_bytes));
+    if (set_sndbuf) try queueFixedSocketOption(ring, option_user_data, slot, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(send_buffer_bytes));
     if (tcp) try queueFixedSocketOption(ring, option_user_data, slot, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(tcp_nodelay));
 
     const sqe = try ring.connect(connect_user_data, @intCast(slot), address, address_len);
@@ -358,6 +372,14 @@ fn queueFixedSocketOption(ring: *IoUring, user_data: u64, slot: u32, level: u32,
 pub fn queueSendFixed(ring: *IoUring, user_data: u64, slot: u32, bytes: []const u8) !void {
     try ensureSqeCapacity(ring, 1);
     const sqe = try ring.send(user_data, @intCast(slot), bytes, posix.MSG.NOSIGNAL);
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+}
+
+/// Queues a gathered send over `msg`'s iovec array. The msghdr and iovecs must
+/// stay valid until the completion arrives.
+pub fn queueSendMsgFixed(ring: *IoUring, user_data: u64, slot: u32, msg: *const linux.msghdr_const) !void {
+    try ensureSqeCapacity(ring, 1);
+    const sqe = try ring.sendmsg(user_data, @intCast(slot), msg, posix.MSG.NOSIGNAL);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 

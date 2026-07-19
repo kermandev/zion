@@ -14,8 +14,14 @@ pub const PosixAddress = extern union {
     un: posix.sockaddr.un,
 };
 
-pub const socket_receive_buffer_bytes: i32 = 32 * 1024;
-pub const socket_send_buffer_bytes: i32 = 16 * 1024;
+// Non-positive values skip the setsockopt and leave the kernel's buffer
+// autotuning in charge. Pinning the receive buffer at 32 KiB measurably
+// throttled loopback runs: it caps the TCP window, so the server stalls on
+// flow control and sends smaller segments (~10% less throughput at a higher
+// CPU cost per byte on both sides). Autotuned buffers only consume memory
+// for data actually queued, so this stays safe at high client counts.
+pub const socket_receive_buffer_bytes: i32 = 0;
+pub const socket_send_buffer_bytes: i32 = 0;
 
 pub const default_port: u16 = 25565;
 pub const default_handshake_host = "localhost";
@@ -103,6 +109,11 @@ pub fn addressToPosix(address: *const Address, storage: *PosixAddress) posix.soc
 
 fn addressUnixToPosix(address: Io.net.UnixAddress, storage: *PosixAddress) posix.socklen_t {
     storage.un.family = posix.AF.UNIX;
+    // UnixAddress.init caps paths at max_len; verify that bound still fits the
+    // kernel sockaddr storage and re-check locally so a caller bypassing init
+    // cannot overflow the copy below.
+    comptime std.debug.assert(Io.net.UnixAddress.max_len <= @typeInfo(@FieldType(posix.sockaddr.un, "path")).array.len);
+    std.debug.assert(address.path.len <= storage.un.path.len);
     @memcpy(storage.un.path[0..address.path.len], address.path);
     var path_len = address.path.len;
     if (path_len < storage.un.path.len) {

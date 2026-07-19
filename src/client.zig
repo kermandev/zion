@@ -29,18 +29,18 @@ pub const CachedPacket = struct {
 
         var frame: Io.Writer.Allocating = .init(allocator);
         defer frame.deinit();
-        try protocol.appendPacketFrame(allocator, &frame, owned_body, .disabled);
+        try protocol.appendPacketFrame(allocator, &frame, owned_body, .disabled, null, null);
 
         var uncompressed_frame: Io.Writer.Allocating = .init(allocator);
         defer uncompressed_frame.deinit();
         if (comptime protocol.compression_enabled) {
-            try protocol.appendPacketFrame(allocator, &uncompressed_frame, owned_body, .{ .enabled = std.math.maxInt(i32) });
+            try protocol.appendPacketFrame(allocator, &uncompressed_frame, owned_body, .{ .enabled = std.math.maxInt(i32) }, null, null);
         }
 
         var compressed_frame: Io.Writer.Allocating = .init(allocator);
         defer compressed_frame.deinit();
         if (comptime protocol.compression_enabled) {
-            try protocol.appendPacketFrame(allocator, &compressed_frame, owned_body, .{ .enabled = 0 });
+            try protocol.appendPacketFrame(allocator, &compressed_frame, owned_body, .{ .enabled = 0 }, null, null);
         }
 
         const frame_slice = try frame.toOwnedSlice();
@@ -131,6 +131,7 @@ pub const Error = error{
 
 const initial_read_buffer_size = 256;
 pub const max_queued_write_bytes = outbound.max_queued_bytes;
+pub const write_segment_capacity = outbound.segment_capacity;
 const client_tick_interval_ms = 50;
 const movement_interval_ms = 1000;
 
@@ -248,6 +249,15 @@ pub const ClientTable = struct {
     broadcast_interval_ms: if (features.broadcast) u64 else void = if (features.broadcast) 0 else {},
     client_tick_packet: if (features.client_tick) ?CachedPacket else void = if (features.client_tick) null else {},
     movement: if (features.movement) MovementConfig else void = if (features.movement) .{} else {},
+    // Per-shard flate scratch reused across compressed outbound packets;
+    // lazily allocated the first time compressed framing is needed.
+    compress_buf: if (protocol.compression_enabled) std.ArrayList(u8) else void = if (protocol.compression_enabled) .empty else {},
+    compress_window: if (protocol.compression_enabled) ?[]u8 else void = if (protocol.compression_enabled) null else {},
+    // Reconnect-warning rate limiting (see pool.reconnectWarnAllowed); a
+    // reconnect storm collapses into one suppression summary per window.
+    warn_window_start_ms: u64 = 0,
+    warn_in_window: u32 = 0,
+    warn_suppressed: u64 = 0,
 
     pub fn deinit(clients: *ClientTable, allocator: std.mem.Allocator) void {
         const sessions = clients.sessions.slice();
@@ -258,6 +268,10 @@ pub const ClientTable = struct {
             writes[i].deinit(allocator);
         }
 
+        if (comptime protocol.compression_enabled) {
+            clients.compress_buf.deinit(allocator);
+            if (clients.compress_window) |window| allocator.free(window);
+        }
         clients.global_indices.deinit(allocator);
         clients.phases.deinit(allocator);
         if (diagnostics_enabled) clients.stats.deinit(allocator);
@@ -413,31 +427,42 @@ pub fn onConnected(clients: *ClientTable, index: usize, phase: *Phase, now_ms: u
 }
 
 pub fn onReadBytes(clients: *ClientTable, index: usize, phase: *Phase, bytes: []const u8, decompress_buf: anytype, decompress_window: anytype, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!ReadResult {
+    const before = readSnapshot(clients, index, phase.*);
+    var result = try onReadBytesRaw(clients, index, phase, bytes, decompress_buf, decompress_window, packet_builder_buf, write_temp_buf);
+    result.effects = readEffects(clients, index, phase.*, before);
+    return result;
+}
+
+/// Parses received bytes without computing `ReadResult.effects`. Callers that
+/// process many receive slices per completion take one `readSnapshot` before
+/// the batch and one `readEffects` after it instead of paying the state
+/// comparisons per slice.
+pub fn onReadBytesRaw(clients: *ClientTable, index: usize, phase: *Phase, bytes: []const u8, decompress_buf: anytype, decompress_window: anytype, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!ReadResult {
     if (bytes.len == 0) return error.Disconnected;
 
-    const write_bytes_before = queuedWriteBytes(clients, index);
-    const deadline_before = nextTimerMs(clients, index, phase.*);
-    const joined_before = joinedLogged(clients, index).*;
     var result: ReadResult = .{ .bytes = bytes.len };
     var input_offset: usize = 0;
-    if (readState(clients, index).discard_remaining > 0) {
-        const discarded = @min(bytes.len, readState(clients, index).discard_remaining);
-        readState(clients, index).discard_remaining -= @intCast(discarded);
+    // Cache the SoA column pointer for this per-packet pass; nothing below
+    // appends to the session table, so the pointer stays valid.
+    const read = readState(clients, index);
+    if (read.discard_remaining > 0) {
+        const discarded = @min(bytes.len, read.discard_remaining);
+        read.discard_remaining -= @intCast(discarded);
         input_offset = discarded;
-        if (input_offset == bytes.len) return finishReadResult(clients, index, phase.*, write_bytes_before, deadline_before, joined_before, result);
+        if (input_offset == bytes.len) return result;
     }
     const input = bytes[input_offset..];
 
-    if (readState(clients, index).offset != readState(clients, index).len) {
+    if (read.offset != read.len) {
         compactReadBuffer(clients, index);
         try appendReadBufferSlice(clients, index, input);
         result = try drainPackets(clients, index, phase, decompress_buf, decompress_window, packet_builder_buf, write_temp_buf);
         result.bytes = bytes.len;
-        return finishReadResult(clients, index, phase.*, write_bytes_before, deadline_before, joined_before, result);
+        return result;
     }
 
-    if (readState(clients, index).buffer != null) {
-        releaseReadBuffer(clients, readState(clients, index));
+    if (read.buffer != null) {
+        releaseReadBuffer(clients, read);
     }
 
     var offset: usize = 0;
@@ -454,31 +479,35 @@ pub fn onReadBytes(clients: *ClientTable, index: usize, phase: *Phase, bytes: []
 
     if (offset < input.len) {
         if (try incompleteSkippedFrameRemaining(clients, index, phase, input[offset..], decompress_window)) |remaining| {
-            readState(clients, index).discard_remaining = @intCast(remaining);
+            read.discard_remaining = @intCast(remaining);
             result.packets += 1;
         } else {
             try appendReadBufferSlice(clients, index, input[offset..]);
         }
     }
-    return finishReadResult(clients, index, phase.*, write_bytes_before, deadline_before, joined_before, result);
+    return result;
 }
 
-fn finishReadResult(
-    clients: *ClientTable,
-    index: usize,
-    phase: Phase,
-    write_bytes_before: usize,
-    deadline_before: ?u64,
-    joined_before: bool,
-    result_value: ReadResult,
-) ReadResult {
-    var result = result_value;
-    result.effects = .{
-        .write_ready = queuedWriteBytes(clients, index) != write_bytes_before,
-        .deadline_changed = nextTimerMs(clients, index, phase) != deadline_before,
-        .progress_changed = joinedLogged(clients, index).* != joined_before,
+pub const ReadSnapshot = struct {
+    write_bytes: usize,
+    deadline: ?u64,
+    joined: bool,
+};
+
+pub fn readSnapshot(clients: *ClientTable, index: usize, phase: Phase) ReadSnapshot {
+    return .{
+        .write_bytes = queuedWriteBytes(clients, index),
+        .deadline = nextTimerMs(clients, index, phase),
+        .joined = joinedLogged(clients, index).*,
     };
-    return result;
+}
+
+pub fn readEffects(clients: *ClientTable, index: usize, phase: Phase, before: ReadSnapshot) ReadEffects {
+    return .{
+        .write_ready = queuedWriteBytes(clients, index) != before.write_bytes,
+        .deadline_changed = nextTimerMs(clients, index, phase) != before.deadline,
+        .progress_changed = joinedLogged(clients, index).* != before.joined,
+    };
 }
 
 fn queuedWriteBytes(clients: *ClientTable, index: usize) usize {
@@ -506,56 +535,62 @@ pub fn onTimerFor(
 ) Error!bool {
     if (phase.* != .play) return false;
     var wrote = false;
+    // Cache the SoA column pointer for this per-timer pass; nothing below
+    // appends to the session table, so the pointer stays valid.
+    const timers = timerState(clients, index);
     const backpressured = writeState(clients, index).isLocked();
     if (comptime features.client_tick) {
-        const due = timerState(clients, index).next_client_tick_ms;
+        const due = timers.next_client_tick_ms;
         if (due != no_deadline) {
             if (now_ms >= due) {
                 if (!backpressured) {
                     try enqueueCachedPacket(clients, index, .client_tick);
                     wrote = true;
                 }
-                timerState(clients, index).next_client_tick_ms = now_ms +| client_tick_interval_ms;
+                timers.next_client_tick_ms = now_ms +| client_tick_interval_ms;
             }
         }
     }
 
     if (comptime features.movement) {
         std.debug.assert(clients.movement.profile == movement_profile);
-        const due = timerState(clients, index).next_movement_ms;
+        const due = timers.next_movement_ms;
         if (due != no_deadline) {
             if (now_ms >= due) {
                 const config = clients.movement;
+                const comp = compressionState(clients, index).*;
                 if (!backpressured) switch (movement_profile) {
                     .idle => {
                         var packet = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.play.serverbound.move_player_status_only);
                         try protocol.version.writeMovementStatusOnly(&packet.writer);
-                        try enqueueBuiltPacket(clients, index, &packet, compressionState(clients, index).*, write_temp_buf);
+                        try enqueueBuiltPacket(clients, index, &packet, comp, write_temp_buf);
                         wrote = true;
                     },
                     .rotate => if (motionState(clients, index).initialized) {
-                        updateMotion(.rotate, motionState(clients, index), config, now_ms);
+                        const motion = motionState(clients, index);
+                        updateMotion(.rotate, motion, config, now_ms);
                         var packet = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.play.serverbound.move_player_rotation);
-                        try protocol.version.writeMovementRotation(&packet.writer, motionState(clients, index).yaw, motionState(clients, index).pitch);
-                        try enqueueBuiltPacket(clients, index, &packet, compressionState(clients, index).*, write_temp_buf);
+                        try protocol.version.writeMovementRotation(&packet.writer, motion.yaw, motion.pitch);
+                        try enqueueBuiltPacket(clients, index, &packet, comp, write_temp_buf);
                         wrote = true;
                     },
                     .walk => if (motionState(clients, index).initialized) {
-                        updateMotion(.walk, motionState(clients, index), config, now_ms);
+                        const motion = motionState(clients, index);
+                        updateMotion(.walk, motion, config, now_ms);
                         var packet = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.play.serverbound.move_player_position_rotation);
-                        try protocol.version.writeMovementPositionRotation(&packet.writer, motionState(clients, index).x, motionState(clients, index).y, motionState(clients, index).z, motionState(clients, index).yaw, motionState(clients, index).pitch);
-                        try enqueueBuiltPacket(clients, index, &packet, compressionState(clients, index).*, write_temp_buf);
+                        try protocol.version.writeMovementPositionRotation(&packet.writer, motion.x, motion.y, motion.z, motion.yaw, motion.pitch);
+                        try enqueueBuiltPacket(clients, index, &packet, comp, write_temp_buf);
                         wrote = true;
                     },
                 };
                 const interval = if (movement_profile == .idle) movement_interval_ms else config.interval_ms;
-                timerState(clients, index).next_movement_ms = now_ms +| interval;
+                timers.next_movement_ms = now_ms +| interval;
             }
         }
     }
 
     if (comptime features.broadcast) {
-        const due = timerState(clients, index).next_broadcast_ms;
+        const due = timers.next_broadcast_ms;
         if (due == no_deadline) return wrote;
         if (now_ms < due) return wrote;
 
@@ -564,7 +599,7 @@ pub fn onTimerFor(
                 try enqueueCachedPacket(clients, index, .broadcast);
                 wrote = true;
             }
-            timerState(clients, index).next_broadcast_ms = now_ms +| clients.broadcast_interval_ms;
+            timers.next_broadcast_ms = now_ms +| clients.broadcast_interval_ms;
         }
     }
     return wrote;
@@ -593,6 +628,24 @@ pub fn wantsWrite(clients: *ClientTable, index: usize) bool {
 
 pub fn beginWrite(clients: *ClientTable, index: usize) []const u8 {
     return resolvePendingWrite(clients, writeState(clients, index).begin());
+}
+
+pub const GatheredWrite = struct {
+    count: u8 = 0,
+    total_bytes: usize = 0,
+};
+
+/// Locks every queued outbound segment for one vectored send and resolves each
+/// to its byte slice. Slices stay valid until onWriteComplete/cancelBeginWrite.
+pub fn beginWriteGather(clients: *ClientTable, index: usize, slices: *[write_segment_capacity][]const u8) GatheredWrite {
+    var pendings: [write_segment_capacity]outbound.Pending = undefined;
+    const count = writeState(clients, index).beginAll(&pendings);
+    var total: usize = 0;
+    for (pendings[0..count], slices[0..count]) |pending, *slice| {
+        slice.* = resolvePendingWrite(clients, pending);
+        total += slice.len;
+    }
+    return .{ .count = count, .total_bytes = total };
 }
 
 fn resolvePendingWrite(clients: *ClientTable, pending: outbound.Pending) []const u8 {
@@ -670,10 +723,13 @@ fn appendWriteBufferSlice(clients: *ClientTable, index: usize, bytes: []const u8
 }
 
 fn drainPackets(clients: *ClientTable, index: usize, phase: *Phase, decompress_buf: anytype, decompress_window: anytype, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!ReadResult {
-    const slice = readBufferSlice(clients, index);
+    // Cache the SoA column pointer for this per-packet loop; nothing below
+    // appends to the session table, so the pointer stays valid.
+    const read = readState(clients, index);
+    const slice: []u8 = if (read.buffer) |buffer| buffer[0..read.len] else &.{};
     var result: ReadResult = .{};
     while (true) {
-        const offset = readState(clients, index).offset;
+        const offset = read.offset;
         if (offset >= slice.len) break;
         if (try nextFrame(slice[offset..])) |frame| {
             const frame_res = try handleFrame(clients, index, phase, frame.bytes, decompress_buf, decompress_window, packet_builder_buf, write_temp_buf);
@@ -683,11 +739,11 @@ fn drainPackets(clients: *ClientTable, index: usize, phase: *Phase, decompress_b
                 if (frame_res.keep_alive_reply_bytes) |pending_bytes| result.keep_alive_reply_bytes = pending_bytes;
             }
             result.packets += 1;
-            readState(clients, index).offset += @intCast(frame.consumed);
+            read.offset += @intCast(frame.consumed);
         } else {
             if (try incompleteSkippedFrameRemaining(clients, index, phase, slice[offset..], decompress_window)) |remaining| {
-                releaseReadBuffer(clients, readState(clients, index));
-                readState(clients, index).discard_remaining = @intCast(remaining);
+                releaseReadBuffer(clients, read);
+                read.discard_remaining = @intCast(remaining);
                 result.packets += 1;
             }
             break;
@@ -698,11 +754,8 @@ fn drainPackets(clients: *ClientTable, index: usize, phase: *Phase, decompress_b
 }
 
 fn handleFrame(clients: *ClientTable, index: usize, phase: *Phase, frame: []const u8, decompress_buf: anytype, decompress_window: anytype, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!FrameResult {
-    if (try shouldSkipFrame(clients, index, phase, frame, decompress_window)) {
+    const packet = (try decodeFrame(clients, index, phase, frame, decompress_buf, decompress_window)) orelse
         return .{ .packet_id = null, .keep_alive = false };
-    }
-
-    const packet = try protocol.readPacketFrame(clients.allocator, frame, compressionState(clients, index).*, if (comptime protocol.compression_enabled) decompress_buf else null, if (comptime protocol.compression_enabled) decompress_window else null);
 
     const keep_alive = try handlePacket(clients, index, phase, packet, packet_builder_buf, write_temp_buf);
     return .{
@@ -712,6 +765,38 @@ fn handleFrame(clients: *ClientTable, index: usize, phase: *Phase, frame: []cons
             if (keep_alive) @intCast(writeState(clients, index).byteCount()) else null
         else {},
     };
+}
+
+/// Decodes a complete frame, parsing the length prefix and packet id exactly
+/// once. Returns null for unhandled play packets, which are skipped without
+/// fully decompressing compressed frames.
+fn decodeFrame(clients: *ClientTable, index: usize, phase: *Phase, frame: []const u8, decompress_buf: anytype, decompress_window: anytype) Error!?protocol.Packet {
+    if (phase.* == .play) {
+        if (comptime protocol.compression_enabled) {
+            if (compressionState(clients, index).* == .enabled) {
+                var frame_reader: Io.Reader = .fixed(frame);
+                var packet_reader = protocol.PacketReader.init(&frame_reader);
+                const data_len = try packet_reader.readVarInt();
+                if (data_len < 0) return error.NegativeLength;
+                if (data_len > protocol.max_packet_len) return error.PacketTooLarge;
+                const body = frame[frame_reader.seek..];
+                if (data_len == 0) {
+                    const packet = try protocol.packetFromPayload(body);
+                    return if (isHandledPlayPacket(packet.id)) packet else null;
+                }
+                return try protocol.readCompressedPacket(clients.allocator, body, @intCast(data_len), decompress_buf, decompress_window, isHandledPlayPacket);
+            }
+        }
+        const packet = try protocol.packetFromPayload(frame);
+        return if (isHandledPlayPacket(packet.id)) packet else null;
+    }
+    return try protocol.readPacketFrame(
+        clients.allocator,
+        frame,
+        compressionState(clients, index).*,
+        if (comptime protocol.compression_enabled) decompress_buf else null,
+        if (comptime protocol.compression_enabled) decompress_window else null,
+    );
 }
 
 fn compactReadBuffer(clients: *ClientTable, index: usize) void {
@@ -727,29 +812,14 @@ fn compactReadBuffer(clients: *ClientTable, index: usize) void {
     readState(clients, index).offset = 0;
 }
 
-fn shouldSkipFrame(clients: *ClientTable, index: usize, phase: *Phase, frame: []const u8, decompress_window: anytype) Error!bool {
-    if (phase.* != .play) return false;
-    if (comptime protocol.compression_enabled) {
-        if (compressionState(clients, index).* == .enabled) {
-            var frame_reader: Io.Reader = .fixed(frame);
-            var packet_reader = protocol.PacketReader.init(&frame_reader);
-            const data_len = try packet_reader.readVarInt();
-            if (data_len < 0) return error.NegativeLength;
-            if (data_len > 0) {
-                const packet_id = try protocol.peekCompressedPacketId(frame[frame_reader.seek..], decompress_window);
-                return !isHandledPlayPacket(packet_id);
-            }
-        }
-    }
-    const packet_id = peekPlayPacketId(clients, index, frame) orelse return false;
-    return !isHandledPlayPacket(packet_id);
-}
-
 fn incompleteSkippedFrameRemaining(clients: *ClientTable, index: usize, phase: *Phase, buffer: []const u8, decompress_window: anytype) Error!?usize {
     if (phase.* != .play) return null;
 
     const outer = peekVarInt(buffer) orelse return null;
-    if (outer.value < 0 or outer.value > protocol.max_packet_len) return null;
+    // Reject oversized or negative declared lengths immediately instead of
+    // buffering the tail until the next pass rejects it.
+    if (outer.value < 0) return error.NegativeLength;
+    if (outer.value > protocol.max_packet_len) return error.PacketTooLarge;
     const frame_end = outer.consumed + @as(usize, @intCast(outer.value));
     if (buffer.len >= frame_end) return null;
 
@@ -757,9 +827,12 @@ fn incompleteSkippedFrameRemaining(clients: *ClientTable, index: usize, phase: *
     if (comptime protocol.compression_enabled) {
         if (compressionState(clients, index).* == .enabled) {
             const data_len = peekVarInt(packet_prefix) orelse return null;
-            if (data_len.value < 0) return null;
+            if (data_len.value < 0) return error.NegativeLength;
+            if (data_len.value > protocol.max_packet_len) return error.PacketTooLarge;
             if (data_len.value > 0) {
-                const packet_id = protocol.peekCompressedPacketId(packet_prefix[data_len.consumed..], decompress_window) catch return null;
+                // Malformed compressed prefixes are rejected here even though
+                // the frame is incomplete; null only means "need more bytes".
+                const packet_id = (try protocol.peekCompressedPacketId(packet_prefix[data_len.consumed..], decompress_window)) orelse return null;
                 return if (isHandledPlayPacket(packet_id)) null else frame_end - buffer.len;
             }
             packet_prefix = packet_prefix[data_len.consumed..];
@@ -769,18 +842,6 @@ fn incompleteSkippedFrameRemaining(clients: *ClientTable, index: usize, phase: *
     const packet_id = peekVarInt(packet_prefix) orelse return null;
     if (isHandledPlayPacket(packet_id.value)) return null;
     return frame_end - buffer.len;
-}
-
-fn peekPlayPacketId(clients: *ClientTable, index: usize, frame: []const u8) ?i32 {
-    var reader: Io.Reader = .fixed(frame);
-    var packet_reader = protocol.PacketReader.init(&reader);
-    if (comptime protocol.compression_enabled) {
-        if (compressionState(clients, index).* == .enabled) {
-            const data_len = packet_reader.readVarInt() catch return null;
-            if (data_len != 0) return null;
-        }
-    }
-    return packet_reader.readVarInt() catch null;
 }
 
 fn handlePacket(clients: *ClientTable, index: usize, phase: *Phase, packet: protocol.Packet, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!bool {
@@ -827,7 +888,9 @@ fn handleLoginPacket(clients: *ClientTable, index: usize, phase: *Phase, packet:
             if (comptime !protocol.compression_enabled) return error.UnexpectedPacket;
             var payload_reader: Io.Reader = .fixed(packet.payload);
             var packet_reader = protocol.PacketReader.init(&payload_reader);
-            compressionState(clients, index).* = .{ .enabled = try packet_reader.readVarInt() };
+            // Vanilla semantics: a negative threshold disables compression.
+            const threshold = try packet_reader.readVarInt();
+            compressionState(clients, index).* = if (threshold < 0) .disabled else .{ .enabled = threshold };
         },
         else => return error.UnexpectedPacket,
     }
@@ -1036,7 +1099,14 @@ fn enqueueCachedPacket(clients: *ClientTable, index: usize, comptime kind: Cache
 
 fn appendWritePacketFrame(clients: *ClientTable, index: usize, packet_data: []const u8, comp: protocol.Compression, write_temp_buf: *Io.Writer.Allocating) Error!void {
     write_temp_buf.clearRetainingCapacity();
-    try protocol.appendPacketFrame(clients.allocator, write_temp_buf, packet_data, comp);
+    if (comptime protocol.compression_enabled) {
+        if (comp == .enabled and clients.compress_window == null) {
+            clients.compress_window = try clients.allocator.alloc(u8, std.compress.flate.max_window_len);
+        }
+        try protocol.appendPacketFrame(clients.allocator, write_temp_buf, packet_data, comp, &clients.compress_buf, clients.compress_window);
+    } else {
+        try protocol.appendPacketFrame(clients.allocator, write_temp_buf, packet_data, comp, null, null);
+    }
     try appendWriteBufferSlice(clients, index, write_temp_buf.written());
 }
 
@@ -1666,6 +1736,32 @@ test "Session drains fragmented login compression packet" {
         try appendReadBufferSlice(&test_session.clients, 0, frame[1..]);
         _ = try drainPackets(&test_session.clients, 0, &phase, &test_session.decompress_buf, test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
         try std.testing.expectEqual(protocol.Compression{ .enabled = 256 }, compressionState(&test_session.clients, 0).*);
+    }
+}
+
+test "Session treats a negative compression threshold as disabled" {
+    if (comptime !protocol.compression_enabled) {
+        return error.SkipZigTest;
+    } else {
+        const allocator = std.testing.allocator;
+        var phase: Phase = .disconnected;
+        var test_session = try TestSession.init(allocator, .{
+            .host = "127.0.0.1",
+            .port = 25565,
+            .username = "Zion0",
+        });
+        defer test_session.deinit();
+        try onConnected(&test_session.clients, 0, &phase, 100, &test_session.packet_builder_buf, &test_session.write_temp_buf);
+        test_session.clearWriteBuffer();
+
+        var packet = try protocol.PacketFrame.init(&test_session.packet_builder_buf, packet_ids.login.clientbound.set_compression);
+        try packet.writer.writeVarInt(-1);
+        const frame = try packet.finish(.disabled);
+        defer allocator.free(frame);
+
+        try appendReadBufferSlice(&test_session.clients, 0, frame);
+        _ = try drainPackets(&test_session.clients, 0, &phase, &test_session.decompress_buf, test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
+        try std.testing.expectEqual(protocol.Compression.disabled, compressionState(&test_session.clients, 0).*);
     }
 }
 

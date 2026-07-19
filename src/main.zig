@@ -36,13 +36,6 @@ pub fn main(init: std.process.Init) !void {
         .run => |run| run,
     };
 
-    const recommended_fds = recommendedFdLimit(options.clients);
-    const fd_limit = try std.posix.getrlimit(.NOFILE);
-    if (fd_limit.cur < recommended_fds) {
-        try stderr.print("warning: process file descriptor limit ({d}) is lower than recommended ({d}); client connections may fail. Run 'ulimit -n {d}' to increase.\n", .{ fd_limit.cur, recommended_fds, recommended_fds });
-        try stderr.flush();
-    }
-
     const resolved_target = endpoint.resolveAndProbe(io, options.target) catch |err| {
         try report.writeReachabilityError(stderr, options.target, err);
         try stderr.flush();
@@ -92,10 +85,6 @@ pub fn main(init: std.process.Init) !void {
     try report.writeStatsBlocking(io, stats);
 }
 
-fn recommendedFdLimit(client_count: usize) usize {
-    return client_count;
-}
-
 test {
     _ = @import("cli.zig");
     _ = @import("endpoint.zig");
@@ -108,8 +97,4 @@ test {
     _ = @import("stats.zig");
     _ = @import("outbound.zig");
     _ = @import("bench.zig");
-}
-
-test "direct socket file limit recommendation matches fixed slots" {
-    try std.testing.expectEqual(@as(usize, 1000), recommendedFdLimit(1000));
 }

@@ -39,7 +39,6 @@ const CompletionKey = ring_module.CompletionKey;
 const packCompletionKey = ring_module.packCompletionKey;
 const unpackCompletionKey = ring_module.unpackCompletionKey;
 const openUring = ring_module.openUring;
-const ioUringEntries = ring_module.ioUringEntries;
 const RecvBufferGroup = ring_module.RecvBufferGroup;
 const recvLayout = ring_module.recvLayout;
 const waitForUringEvents = ring_module.waitForUringEvents;
@@ -48,8 +47,10 @@ const registerFixedFiles = ring_module.registerFixedFiles;
 const queueSocketDirect = ring_module.queueSocketDirect;
 const queueConfigureAndConnectFixed = ring_module.queueConfigureAndConnectFixed;
 const queueSendFixed = ring_module.queueSendFixed;
+const queueSendMsgFixed = ring_module.queueSendMsgFixed;
 const queueRecvMultishotFixed = ring_module.queueRecvMultishotFixed;
 const queueShutdownAndCloseFixed = ring_module.queueShutdownAndCloseFixed;
+const queuePollOut = ring_module.queuePollOut;
 
 var stop_requested = std.atomic.Value(bool).init(false);
 
@@ -106,6 +107,10 @@ const LoopContext = struct {
     address: endpoint.Address,
     connect_address: PosixAddress,
     connect_address_length: posix.socklen_t,
+    // Per-client gathered-send state; the kernel reads the msghdr and iovecs
+    // referenced by an in-flight IORING_OP_SENDMSG, so both live for the run.
+    send_iovecs: [][client.write_segment_capacity]posix.iovec_const,
+    send_msghdrs: []linux.msghdr_const,
     socket_receive_buffer_bytes: i32 = endpoint.socket_receive_buffer_bytes,
     socket_send_buffer_bytes: i32 = endpoint.socket_send_buffer_bytes,
     tcp_nodelay: i32 = 1,
@@ -134,11 +139,9 @@ pub fn run(
     }
 
     const threads = try allocator.alloc(std.Thread, shards);
-    errdefer allocator.free(threads);
     defer allocator.free(threads);
 
     const contexts = try allocator.alloc(ShardContext, shards);
-    errdefer allocator.free(contexts);
     defer allocator.free(contexts);
 
     const shard_progress: ProgressSink = .none;
@@ -266,7 +269,8 @@ fn runShardLoop(
     var recv_buffers = try RecvBufferGroup.init(&ring, allocator, recv_buffer_group_id, recvLayout(&ring, bots.len));
     defer recv_buffers.deinit(allocator);
 
-    const event_capacity: usize = @intCast(ioUringEntries(bots.len));
+    // Sized to the CQ so one iteration drains everything the kernel can hold.
+    const event_capacity: usize = ring.cq.cqes.len;
     const events = try allocator.alloc(linux.io_uring_cqe, event_capacity);
     defer allocator.free(events);
 
@@ -274,6 +278,11 @@ fn runShardLoop(
     defer scheduler.deinit();
     const due_clients = try allocator.alloc(u32, bots.len);
     defer allocator.free(due_clients);
+
+    const send_iovecs = try allocator.alloc([client.write_segment_capacity]posix.iovec_const, bots.len);
+    defer allocator.free(send_iovecs);
+    const send_msghdrs = try allocator.alloc(linux.msghdr_const, bots.len);
+    defer allocator.free(send_msghdrs);
     for (0..bots.len) |i| scheduler.schedule(i, clients.pool.slice().items(.next_attempt_ms)[i]);
 
     var connect_address: PosixAddress = undefined;
@@ -292,6 +301,8 @@ fn runShardLoop(
         .address = resolved_target.address,
         .connect_address = connect_address,
         .connect_address_length = connect_address_length,
+        .send_iovecs = send_iovecs,
+        .send_msghdrs = send_msghdrs,
     };
     if (comptime diagnostics_enabled) ctx.aggregate.diagnostics.observeCq(0, @intCast(ring.cq.cqes.len));
 
@@ -313,14 +324,13 @@ fn runShardLoop(
             const key = unpackCompletionKey(event.user_data) orelse continue;
             if (key.kind == .recv) continue;
             try processUringEvent(&ctx, event, loop_now, progress);
-            trimScratchBuffers(&ctx);
         }
         for (events[0..ready]) |event| {
             const key = unpackCompletionKey(event.user_data) orelse continue;
             if (key.kind != .recv) continue;
             try processUringEvent(&ctx, event, loop_now, progress);
-            trimScratchBuffers(&ctx);
         }
+        trimScratchBuffers(&ctx);
     }
 
     if (comptime diagnostics_enabled) {
@@ -436,7 +446,8 @@ fn processUringEvent(
         .connect => try handleConnectReady(ctx, event, key, now_ms, progress),
         .socket => try handleSocketReady(ctx, event, key, now_ms, progress),
         .socket_option => return,
-        .close => try handleCloseReady(ctx, event, key),
+        .close => handleCloseReady(ctx, event, key),
+        .poll => try handlePollReady(ctx, event, key, now_ms, progress),
     }
 }
 
@@ -472,12 +483,16 @@ fn handleSocketReady(ctx: *LoopContext, event: linux.io_uring_cqe, key: Completi
     };
 }
 
-fn handleCloseReady(ctx: *LoopContext, event: linux.io_uring_cqe, key: CompletionKey) !void {
+fn handleCloseReady(ctx: *LoopContext, event: linux.io_uring_cqe, key: CompletionKey) void {
     if (key.index >= ctx.clients.global_indices.items.len) return;
     const pool = ctx.clients.pool.slice();
     const index = key.index;
     if (key.generation != pool.items(.close_generation)[index] or !pool.items(.flags)[index].close_armed) return;
-    if (event.err() != .SUCCESS) return error.Unexpected;
+    // A failed close (e.g. EBADF on a recycled direct slot) must not tear down
+    // the shard; the slot is unusable either way, so retire it and move on.
+    if (comptime diagnostics_enabled) {
+        if (event.err() != .SUCCESS) ctx.aggregate.diagnostics.close_failures += 1;
+    }
     pool.items(.flags)[index].close_armed = false;
     pool.items(.flags)[index].socket_live = false;
     finishDraining(ctx, index);
@@ -567,19 +582,20 @@ fn handleRecvReady(
     defer ctx.recv_buffers.releaseBatch(release_batch);
     if (comptime diagnostics_enabled) {
         const batch_bytes: u64 = @intCast(event.res);
-        const batch_buffers: u32 = @intCast(std.math.divCeil(
-            usize,
-            @intCast(event.res),
-            ctx.recv_buffers.buffer_size,
-        ) catch 1);
+        // buffer_size is a power of two; shift instead of a hardware divide.
+        const size: u64 = ctx.recv_buffers.buffer_size;
+        const batch_buffers: u32 = @intCast((batch_bytes + size - 1) >> @intCast(@ctz(size)));
         ctx.aggregate.diagnostics.max_recv_bundle_bytes = @max(ctx.aggregate.diagnostics.max_recv_bundle_bytes, batch_bytes);
         ctx.aggregate.diagnostics.max_recv_bundle_buffers = @max(ctx.aggregate.diagnostics.max_recv_bundle_buffers, batch_buffers);
     }
 
     const phase = ctx.clients.getPhase(index);
+    // Snapshot once per completion rather than per receive slice; a bundled
+    // recv can span many slices and the effect comparisons are per-batch state.
+    const before = client.readSnapshot(ctx.clients, index, phase.*);
     var read_result: client.ReadResult = .{};
     while (batch.next()) |recv_slice| {
-        const part = client.onReadBytes(ctx.clients, index, phase, ctx.recv_buffers.bytes(recv_slice), ctx.decompress_buf, ctx.decompress_window, ctx.packet_builder_buf, ctx.write_temp_buf) catch |err| {
+        const part = client.onReadBytesRaw(ctx.clients, index, phase, ctx.recv_buffers.bytes(recv_slice), ctx.decompress_buf, ctx.decompress_window, ctx.packet_builder_buf, ctx.write_temp_buf) catch |err| {
             try failRuntime(ctx, index, err, now_ms, progress);
             return;
         };
@@ -587,13 +603,11 @@ fn handleRecvReady(
         read_result.packets += part.packets;
         read_result.keep_alives += part.keep_alives;
         if (part.last_packet_id) |id| read_result.last_packet_id = id;
-        read_result.effects.write_ready = read_result.effects.write_ready or part.effects.write_ready;
-        read_result.effects.deadline_changed = read_result.effects.deadline_changed or part.effects.deadline_changed;
-        read_result.effects.progress_changed = read_result.effects.progress_changed or part.effects.progress_changed;
         if (comptime diagnostics_enabled) {
             if (part.keep_alive_reply_bytes) |pending_bytes| read_result.keep_alive_reply_bytes = pending_bytes;
         }
     }
+    read_result.effects = client.readEffects(ctx.clients, index, phase.*, before);
     if (stats_enabled) {
         ctx.aggregate.bytes_received += read_result.bytes;
         ctx.aggregate.packets_received += read_result.packets;
@@ -641,8 +655,11 @@ fn handleSendReady(
     if (errno != .SUCCESS) {
         switch (errno) {
             .AGAIN => {
+                // The socket buffer is genuinely full: wait for POLLOUT and
+                // re-issue the send from its completion instead of
+                // hot-resubmitting.
                 client.cancelBeginWrite(ctx.clients, index);
-                try armSend(ctx, index);
+                armSendPoll(ctx, index) catch |err| try failRuntime(ctx, index, err, now_ms, progress);
                 return;
             },
             else => try failRuntime(ctx, index, error.Disconnected, now_ms, progress),
@@ -665,6 +682,40 @@ fn handleSendReady(
     }
     if (stats_enabled) {
         ctx.aggregate.bytes_sent += @intCast(event.res);
+    }
+
+    try armSend(ctx, index);
+}
+
+// Arms a POLLOUT keyed to the current send generation. The completion is only
+// acted on if the generation still matches: any intervening send re-arm or
+// reconnect bumps send_generation and makes the poll a stale no-op.
+fn armSendPoll(ctx: *LoopContext, index: usize) !void {
+    const pool = ctx.clients.pool.slice();
+    try queuePollOut(ctx.ring, packCompletionKey(.{
+        .kind = .poll,
+        .generation = pool.items(.send_generation)[index],
+        .index = index,
+    }), @intCast(index));
+}
+
+fn handlePollReady(
+    ctx: *LoopContext,
+    event: linux.io_uring_cqe,
+    key: CompletionKey,
+    now_ms: u64,
+    progress: ProgressSink,
+) !void {
+    if (key.index >= ctx.clients.global_indices.items.len) return;
+
+    const pool = ctx.clients.pool.slice();
+    const index = key.index;
+    if (key.generation != pool.items(.send_generation)[index]) return;
+    if (pool.items(.state)[index] != .connected) return;
+
+    if (event.err() != .SUCCESS) {
+        try failRuntime(ctx, index, error.Disconnected, now_ms, progress);
+        return;
     }
 
     try armSend(ctx, index);
@@ -732,37 +783,39 @@ fn failClient(clients: *ClientTable, index: usize, err: anyerror, now_ms: u64, p
     const delay: u64 = pool.items(.backoff_ms)[index];
     if (!builtin.is_test and !progress.suppressesLogs()) {
         if (clients.io) |io| {
-            var username_buffer: [16]u8 = undefined;
-            const client_username = client.username(clients, index, &username_buffer) catch "<invalid>";
-            switch (target) {
-                .tcp => printStderr(io, "warning: client {s}@{s}:{d} disconnected: {t}; reconnecting in {d}ms\n", .{
-                    client_username,
-                    clients.handshake_host,
-                    clients.handshake_port,
-                    err,
-                    delay,
-                }),
-                .unix => |unix| printStderr(io, "warning: client {s}@unix:{s} (handshake {s}:{d}) disconnected: {t}; reconnecting in {d}ms\n", .{
-                    client_username,
-                    unix.path,
-                    clients.handshake_host,
-                    clients.handshake_port,
-                    err,
-                    delay,
-                }),
-            }
-            if (diagnostics_enabled) {
-                const stats = clients.stats.slice();
-                const last_packet_before = stats.items(.last_packet_id)[index];
-                printStderr(io, "warning: client state before reconnect: phase={s} last_packet=0x{x}\n", .{
-                    @tagName(phase_before),
-                    last_packet_before,
-                });
-                printStderr(io, "warning: keep-alives answered={d}\n", .{
-                    stats.items(.keep_alives_answered)[index],
-                });
-            } else {
-                printStderr(io, "warning: client state before reconnect: phase={s}\n", .{@tagName(phase_before)});
+            if (reconnectWarnAllowed(clients, io, now_ms)) {
+                var username_buffer: [16]u8 = undefined;
+                const client_username = client.username(clients, index, &username_buffer) catch "<invalid>";
+                switch (target) {
+                    .tcp => printStderr(io, "warning: client {s}@{s}:{d} disconnected: {t}; reconnecting in {d}ms\n", .{
+                        client_username,
+                        clients.handshake_host,
+                        clients.handshake_port,
+                        err,
+                        delay,
+                    }),
+                    .unix => |unix| printStderr(io, "warning: client {s}@unix:{s} (handshake {s}:{d}) disconnected: {t}; reconnecting in {d}ms\n", .{
+                        client_username,
+                        unix.path,
+                        clients.handshake_host,
+                        clients.handshake_port,
+                        err,
+                        delay,
+                    }),
+                }
+                if (diagnostics_enabled) {
+                    const stats = clients.stats.slice();
+                    const last_packet_before = stats.items(.last_packet_id)[index];
+                    printStderr(io, "warning: client state before reconnect: phase={s} last_packet=0x{x}\n", .{
+                        @tagName(phase_before),
+                        last_packet_before,
+                    });
+                    printStderr(io, "warning: keep-alives answered={d}\n", .{
+                        stats.items(.keep_alives_answered)[index],
+                    });
+                } else {
+                    printStderr(io, "warning: client state before reconnect: phase={s}\n", .{@tagName(phase_before)});
+                }
             }
         }
     }
@@ -879,8 +932,9 @@ fn armSend(ctx: *LoopContext, index: usize) !void {
     if (pool.items(.state)[index] != .connected) return;
     if (!pool.items(.flags)[index].socket_live) return;
 
-    const bytes = client.beginWrite(ctx.clients, index);
-    if (bytes.len == 0) return;
+    var slices: [client.write_segment_capacity][]const u8 = undefined;
+    const gathered = client.beginWriteGather(ctx.clients, index, &slices);
+    if (gathered.count == 0) return;
 
     pool.items(.send_generation)[index] +%= 1;
     pool.items(.flags)[index].send_armed = true;
@@ -888,11 +942,32 @@ fn armSend(ctx: *LoopContext, index: usize) !void {
         pool.items(.flags)[index].send_armed = false;
         client.cancelBeginWrite(ctx.clients, index);
     }
-    try queueSendFixed(ctx.ring, packCompletionKey(.{
+    const key = packCompletionKey(.{
         .kind = .send,
         .generation = pool.items(.send_generation)[index],
         .index = index,
-    }), @intCast(index), bytes);
+    });
+    if (gathered.count == 1) {
+        try queueSendFixed(ctx.ring, key, @intCast(index), slices[0]);
+        return;
+    }
+
+    // Flush every queued segment in one gathered submission instead of one
+    // send round trip per segment.
+    const iovecs = &ctx.send_iovecs[index];
+    for (slices[0..gathered.count], iovecs[0..gathered.count]) |bytes, *iovec| {
+        iovec.* = .{ .base = bytes.ptr, .len = bytes.len };
+    }
+    ctx.send_msghdrs[index] = .{
+        .name = null,
+        .namelen = 0,
+        .iov = iovecs,
+        .iovlen = gathered.count,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    try queueSendMsgFixed(ctx.ring, key, @intCast(index), &ctx.send_msghdrs[index]);
 }
 
 fn armRecv(ctx: *LoopContext, index: usize) !void {
@@ -910,15 +985,51 @@ fn armRecv(ctx: *LoopContext, index: usize) !void {
     }), @intCast(index));
 }
 
+const reconnect_warn_window_ms: u64 = 1000;
+const reconnect_warn_burst = 10;
+
+// Rate-limits the per-client reconnect warning blocks so a reconnect storm
+// cannot flood stderr: at most `reconnect_warn_burst` per shard per window,
+// with skipped warnings reported once when the next window opens.
+fn reconnectWarnAllowed(clients: *ClientTable, io: Io, now_ms: u64) bool {
+    if (now_ms -| clients.warn_window_start_ms >= reconnect_warn_window_ms) {
+        if (clients.warn_suppressed != 0) {
+            printStderr(io, "warning: suppressed {d} reconnect warnings in the last {d}ms\n", .{
+                clients.warn_suppressed,
+                now_ms -| clients.warn_window_start_ms,
+            });
+        }
+        clients.warn_window_start_ms = now_ms;
+        clients.warn_in_window = 0;
+        clients.warn_suppressed = 0;
+    }
+    if (clients.warn_in_window >= reconnect_warn_burst) {
+        clients.warn_suppressed += 1;
+        return false;
+    }
+    clients.warn_in_window += 1;
+    return true;
+}
+
 fn printStderr(io: Io, comptime fmt: []const u8, args: anytype) void {
     var buffer: [512]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
-    writer.print(fmt, args) catch return;
+    writer.print(fmt, args) catch {
+        // Message exceeds the buffer: emit the truncated prefix rather than
+        // dropping it entirely.
+        Io.File.stderr().writeStreamingAll(io, writer.buffered()) catch {};
+        Io.File.stderr().writeStreamingAll(io, "...\n") catch {};
+        return;
+    };
     Io.File.stderr().writeStreamingAll(io, writer.buffered()) catch {};
 }
 
 fn monotonicMs(io: Io) u64 {
-    return @intCast(Io.Timestamp.now(io, .awake).toMilliseconds());
+    // Timestamp nanoseconds are i96, so toMilliseconds lowers to a __divti3
+    // libcall. The monotonic clock is non-negative and fits u64 for centuries;
+    // a u64 divide by a constant lowers to a multiply-shift instead.
+    const ns: u64 = @intCast(Io.Timestamp.now(io, .awake).nanoseconds);
+    return ns / std.time.ns_per_ms;
 }
 
 fn shouldStop() bool {

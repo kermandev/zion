@@ -47,6 +47,7 @@ const RawOptions = struct {
 
 pub fn parse(args: *std.process.Args.Iterator) !Action {
     var raw: RawOptions = .{};
+    var unknown_flag = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--target")) {
             raw.target = parseTarget(try nextValue(args)) catch return error.InvalidArgs;
@@ -63,6 +64,7 @@ pub fn parse(args: *std.process.Args.Iterator) !Action {
             raw.connect_rate_per_sec = try parseIntArg(u32, try nextValue(args));
         } else if (std.mem.eql(u8, arg, "--username-prefix")) {
             raw.username_prefix = try nextValue(args);
+            if (raw.username_prefix.len == 0) return error.InvalidArgs;
         } else if (std.mem.eql(u8, arg, "--known-core-pack")) {
             raw.known_core_pack = true;
         } else if (std.mem.eql(u8, arg, "--broadcast-ms")) {
@@ -106,15 +108,18 @@ pub fn parse(args: *std.process.Args.Iterator) !Action {
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
             raw.version = true;
         } else {
-            return error.InvalidArgs;
+            // Defer the error so --help/--version anywhere in argv still wins.
+            unknown_flag = true;
         }
     }
+
+    if (raw.help) return .help;
+    if (raw.version) return .version;
+    if (unknown_flag) return error.InvalidArgs;
 
     if (comptime features.broadcast) {
         if ((raw.broadcast_ms == null) != (raw.broadcast_message == null)) return error.InvalidArgs;
     }
-    if (raw.help) return .help;
-    if (raw.version) return .version;
 
     var target = raw.target orelse return error.InvalidArgs;
     switch (target) {
@@ -128,6 +133,11 @@ pub fn parse(args: *std.process.Args.Iterator) !Action {
     const clients = raw.clients orelse return error.InvalidArgs;
     if (clients == 0) return error.InvalidArgs;
     if (raw.shards) |shards| if (shards == 0) return error.InvalidArgs;
+
+    // Minecraft caps usernames at 16 characters. Usernames are the prefix
+    // followed by a 1-based client number, so the prefix plus the digits of
+    // the highest client number must fit.
+    if (raw.username_prefix.len + decimalDigits(clients) > 16) return error.InvalidArgs;
 
     return .{ .run = .{
         .target = target,
@@ -153,6 +163,66 @@ test "parse version does not require run options" {
     _ = args.skip();
 
     try std.testing.expectEqual(Action.version, try parse(&args));
+}
+
+test "parse lets help and version win over semantic validation" {
+    if (comptime features.broadcast) {
+        // --broadcast without --broadcast-ms is semantically invalid, but
+        // --help must still short-circuit.
+        const help_argv = [_][*:0]const u8{ "zion", "--broadcast", "hello", "--help" };
+        var help_args = try std.process.Args.Iterator.initAllocator(.{ .vector = &help_argv }, std.testing.allocator);
+        defer help_args.deinit();
+        _ = help_args.skip();
+        try std.testing.expectEqual(Action.help, try parse(&help_args));
+    }
+
+    const version_argv = [_][*:0]const u8{ "zion", "--clients", "0", "--version" };
+    var version_args = try std.process.Args.Iterator.initAllocator(.{ .vector = &version_argv }, std.testing.allocator);
+    defer version_args.deinit();
+    _ = version_args.skip();
+    try std.testing.expectEqual(Action.version, try parse(&version_args));
+
+    const unknown_argv = [_][*:0]const u8{ "zion", "--frobnicate", "--help" };
+    var unknown_args = try std.process.Args.Iterator.initAllocator(.{ .vector = &unknown_argv }, std.testing.allocator);
+    defer unknown_args.deinit();
+    _ = unknown_args.skip();
+    try std.testing.expectEqual(Action.help, try parse(&unknown_args));
+
+    const invalid_argv = [_][*:0]const u8{ "zion", "--frobnicate", "--target", "127.0.0.1", "--clients", "10" };
+    var invalid_args = try std.process.Args.Iterator.initAllocator(.{ .vector = &invalid_argv }, std.testing.allocator);
+    defer invalid_args.deinit();
+    _ = invalid_args.skip();
+    try std.testing.expectError(error.InvalidArgs, parse(&invalid_args));
+}
+
+test "parse validates username prefix length against the client count" {
+    const empty_argv = [_][*:0]const u8{ "zion", "--target", "127.0.0.1", "--clients", "10", "--username-prefix", "" };
+    var empty_args = try std.process.Args.Iterator.initAllocator(.{ .vector = &empty_argv }, std.testing.allocator);
+    defer empty_args.deinit();
+    _ = empty_args.skip();
+    try std.testing.expectError(error.InvalidArgs, parse(&empty_args));
+
+    // 14-char prefix + 2 digits ("10") = 16: fits exactly.
+    const fits_argv = [_][*:0]const u8{ "zion", "--target", "127.0.0.1", "--clients", "10", "--username-prefix", "AAAAAAAAAAAAAA" };
+    var fits_args = try std.process.Args.Iterator.initAllocator(.{ .vector = &fits_argv }, std.testing.allocator);
+    defer fits_args.deinit();
+    _ = fits_args.skip();
+    const fits = (try parse(&fits_args)).run;
+    try std.testing.expectEqualStrings("AAAAAAAAAAAAAA", fits.username_prefix);
+
+    // 14-char prefix + 3 digits ("100") = 17: exceeds the 16-char limit.
+    const overflow_argv = [_][*:0]const u8{ "zion", "--target", "127.0.0.1", "--clients", "100", "--username-prefix", "AAAAAAAAAAAAAA" };
+    var overflow_args = try std.process.Args.Iterator.initAllocator(.{ .vector = &overflow_argv }, std.testing.allocator);
+    defer overflow_args.deinit();
+    _ = overflow_args.skip();
+    try std.testing.expectError(error.InvalidArgs, parse(&overflow_args));
+}
+
+fn decimalDigits(value: usize) usize {
+    var digits: usize = 1;
+    var remaining = value / 10;
+    while (remaining != 0) : (remaining /= 10) digits += 1;
+    return digits;
 }
 
 fn nextValue(args: *std.process.Args.Iterator) ![]const u8 {

@@ -234,31 +234,41 @@ fn runTimerSample(
     defer write_temp_buf.deinit();
     try write_temp_buf.ensureTotalCapacity(128);
 
+    // Hoist the SoA column pointers out of the timed loop so the benchmark
+    // measures the timer/movement work rather than MultiArrayList index math.
+    // Capacity was reserved and the per-client write buffers pre-grown above, so
+    // no column reallocates during the loop and these slices stay valid.
+    const sessions = clients.sessions.slice();
+    const timers = sessions.items(.timers);
+    const writes = sessions.items(.write);
+    const phases = clients.phases.items;
+    const motions = if (comptime profile != .idle) clients.motion_states.items else {};
+
     const started = Io.Timestamp.now(io, .awake).toNanoseconds();
     var checksum: u64 = 0;
     var index: usize = 0;
     var now_ms = config.interval_ms;
     for (0..config.min_actions) |_| {
-        client.timerState(&clients, index).next_movement_ms = now_ms;
+        timers[index].next_movement_ms = now_ms;
         const wrote = try client.onTimerFor(
             profile,
             &clients,
             index,
-            &clients.phases.items[index],
+            &phases[index],
             now_ms,
             &packet_builder_buf,
             &write_temp_buf,
         );
         if (!wrote) return error.TimerDidNotWrite;
-        const byte_count = client.writeState(&clients, index).byteCount();
+        const byte_count = writes[index].byteCount();
         checksum = (checksum *% 0x9e3779b185ebca87) ^ byte_count ^ index;
         if (comptime profile != .idle) {
-            const motion = client.motionState(&clients, index);
+            const motion = &motions[index];
             const yaw_bits: u32 = @bitCast(motion.yaw);
             checksum ^= yaw_bits;
             if (comptime profile == .walk) checksum ^= @as(u64, @bitCast(motion.x));
         }
-        client.writeState(&clients, index).clearRetainingCapacity();
+        writes[index].clearRetainingCapacity();
 
         index += 1;
         if (index == config.clients) {

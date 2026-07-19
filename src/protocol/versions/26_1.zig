@@ -13,15 +13,15 @@ pub fn writeLoginStart(packet: anytype, username: []const u8, offline_uuid: [16]
 }
 
 pub fn writeClientInformation(packet: anytype) @TypeOf(packet.*).Error!void {
-    try packet.writeString("en_us", 16);
-    try packet.writeByte(2);
-    try packet.writeVarInt(0);
-    try packet.writeBool(true);
-    try packet.writeByte(0x7f);
-    try packet.writeVarInt(1);
-    try packet.writeBool(false);
-    try packet.writeBool(true);
-    try packet.writeVarInt(0);
+    try packet.writeString("en_us", 16); // Locale
+    try packet.writeByte(2); // View Distance
+    try packet.writeVarInt(0); // Chat Mode (0 = enabled)
+    try packet.writeBool(true); // Chat Colors
+    try packet.writeByte(0x7f); // Displayed Skin Parts (all layers)
+    try packet.writeVarInt(1); // Main Hand (1 = right)
+    try packet.writeBool(false); // Enable Text Filtering
+    try packet.writeBool(true); // Allow Server Listings
+    try packet.writeVarInt(0); // Particle Status (0 = all)
 }
 
 pub fn writeKnownPacks(packet: anytype, core_version: ?[]const u8) @TypeOf(packet.*).Error!void {
@@ -33,13 +33,13 @@ pub fn writeKnownPacks(packet: anytype, core_version: ?[]const u8) @TypeOf(packe
 }
 
 pub fn writeChatMessage(packet: anytype, message: []const u8, real_ms: i64) @TypeOf(packet.*).Error!void {
-    try packet.writeString(message, 256);
-    try packet.writeI64(real_ms);
-    try packet.writeI64(0);
-    try packet.writeBool(false);
-    try packet.writeVarInt(0);
-    try packet.writeBytes(&.{ 0, 0, 0 });
-    try packet.writeByte(0);
+    try packet.writeString(message, 256); // Message
+    try packet.writeI64(real_ms); // Timestamp
+    try packet.writeI64(0); // Salt
+    try packet.writeBool(false); // Has Signature (signature absent)
+    try packet.writeVarInt(0); // Message Count
+    try packet.writeBytes(&.{ 0, 0, 0 }); // Acknowledged (20-bit fixed bitset)
+    try packet.writeByte(0); // Checksum
 }
 
 pub fn writeChunkBatchReceived(packet: anytype) @TypeOf(packet.*).Error!void {

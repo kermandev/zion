@@ -21,24 +21,28 @@ pub const packet_ids = struct {
     pub const login = v26_1.packet_ids.login;
     pub const configuration = struct {
         pub const clientbound = struct {
-            pub const plugin_message = 0x01;
-            pub const disconnect = 0x02;
-            pub const finish = 0x03;
-            pub const keep_alive = 0x04;
-            pub const ping = 0x05;
-            pub const add_resource_pack = 0x09;
+            const base = v26_1.packet_ids.configuration.clientbound;
+            pub const plugin_message = base.plugin_message;
+            pub const disconnect = base.disconnect;
+            pub const finish = base.finish;
+            pub const keep_alive = base.keep_alive;
+            pub const ping = base.ping;
+            pub const add_resource_pack = base.add_resource_pack;
+            /// Shifted from 0x0e in 26.1.
             pub const known_packs = 0x0f;
         };
         pub const serverbound = v26_1.packet_ids.configuration.serverbound;
     };
     pub const play = struct {
         pub const clientbound = struct {
-            pub const chunk_batch_finished = 0x0b;
-            pub const disconnect = 0x20;
-            pub const keep_alive = 0x2c;
-            pub const login = 0x31;
-            pub const ping = 0x3d;
-            pub const player_position = 0x48;
+            const base = v26_1.packet_ids.play.clientbound;
+            pub const chunk_batch_finished = base.chunk_batch_finished;
+            pub const disconnect = base.disconnect;
+            pub const keep_alive = base.keep_alive;
+            pub const login = base.login;
+            pub const ping = base.ping;
+            pub const player_position = base.player_position;
+            /// Shifted from 0x76 in 26.1.
             pub const start_configuration = 0x77;
         };
         pub const serverbound = v26_1.packet_ids.play.serverbound;

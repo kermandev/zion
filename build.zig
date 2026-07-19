@@ -56,8 +56,20 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
 
+    // Tests get their own module (same source and options as the executable)
+    // so -Dstrip=true never strips debug info out of the test binary.
+    const test_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = false,
+    });
+    test_module.addOptions("build_options", build_options);
+    test_module.addImport("minecraft_version", minecraft_version_module);
+    test_module.link_libc = true;
+
     const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
+        .root_module = test_module,
         .use_llvm = true,
     });
 
@@ -66,6 +78,9 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
 
+    // Fuzzing reuses the test binary: the build runner's --fuzz flag switches
+    // the shared test-runner process into fuzz mode, so this step is the test
+    // step under another name for `zig build fuzz --fuzz=<iterations>`.
     const fuzz_step = b.step("fuzz", "Run builtin fuzz targets (pass --fuzz or --fuzz=<iterations>)");
     fuzz_step.dependOn(&run_exe_tests.step);
 

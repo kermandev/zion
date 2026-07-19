@@ -6,7 +6,7 @@ pub fn main(init: std.process.Init) !void {
     var file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &buffer);
     const writer = &file_writer.interface;
 
-    inline for (catalog.all) |release| {
+    for (catalog.all) |release| {
         try writer.print("{s}\n", .{release.minecraft_version});
     }
     try writer.flush();

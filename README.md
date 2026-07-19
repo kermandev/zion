@@ -10,7 +10,6 @@ clients from one process.
 - Zig 0.17. The current tree is tested with
   `0.17.0-dev.1415+64dfaa568`.
 - A Minecraft Java server that accepts offline mode clients.
-- A file descriptor limit at least as large as the requested client count.
 
 Zion does not support macOS or Windows. It uses `std.Io` for readers, writers,
 files, clocks, and sleeps, while driving `std.os.linux.IoUring` directly. Zig's
@@ -71,11 +70,9 @@ zig build -Doptimize=ReleaseFast -Dminimal=true -Denable-compression=true
 
 ## Run
 
-Before a large run, raise the file descriptor limit:
-
-```sh
-ulimit -n 65536
-```
+Client sockets are registered as direct descriptors in io_uring's fixed-file
+table, so the process file descriptor limit does not need to scale with the
+client count.
 
 Connect 1,000 clients to a local server:
 

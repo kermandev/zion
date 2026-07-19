@@ -71,6 +71,7 @@ pub const Disconnects = struct {
 pub const Diagnostics = struct {
     recv_nobufs: u64 = 0,
     cq_overflow: u64 = 0,
+    close_failures: u64 = 0,
     max_cq_ready: u32 = 0,
     max_cq_entries: u32 = 0,
     max_recv_bundle_bytes: u64 = 0,
@@ -83,6 +84,7 @@ pub const Diagnostics = struct {
     pub fn add(self: *Diagnostics, other: Diagnostics) void {
         self.recv_nobufs += other.recv_nobufs;
         self.cq_overflow += other.cq_overflow;
+        self.close_failures += other.close_failures;
         self.observeCq(other.max_cq_ready, other.max_cq_entries);
         self.max_recv_bundle_bytes = @max(self.max_recv_bundle_bytes, other.max_recv_bundle_bytes);
         self.max_recv_bundle_buffers = @max(self.max_recv_bundle_buffers, other.max_recv_bundle_buffers);
@@ -143,6 +145,7 @@ test "diagnostics aggregate pressure and retain peak CQ utilization" {
     var diagnostics: Diagnostics = .{
         .recv_nobufs = 2,
         .cq_overflow = 3,
+        .close_failures = 1,
         .max_cq_ready = 100,
         .max_cq_entries = 512,
         .max_recv_bundle_bytes = 8192,
@@ -155,6 +158,7 @@ test "diagnostics aggregate pressure and retain peak CQ utilization" {
     diagnostics.add(.{
         .recv_nobufs = 7,
         .cq_overflow = 11,
+        .close_failures = 2,
         .max_cq_ready = 80,
         .max_cq_entries = 256,
         .max_recv_bundle_bytes = 16_384,
@@ -167,6 +171,7 @@ test "diagnostics aggregate pressure and retain peak CQ utilization" {
 
     try std.testing.expectEqual(@as(u64, 9), diagnostics.recv_nobufs);
     try std.testing.expectEqual(@as(u64, 14), diagnostics.cq_overflow);
+    try std.testing.expectEqual(@as(u64, 3), diagnostics.close_failures);
     try std.testing.expectEqual(@as(u32, 80), diagnostics.max_cq_ready);
     try std.testing.expectEqual(@as(u32, 256), diagnostics.max_cq_entries);
     try std.testing.expectEqual(@as(u64, 16_384), diagnostics.max_recv_bundle_bytes);

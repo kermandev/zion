@@ -40,9 +40,20 @@ pub fn writeUsage(writer: *Io.Writer) !void {
         \\  --handshake-port <port>     Unix-only handshake port. Default: 25565
         \\  --clients <count>           Number of simulated clients (required)
         \\  --shards <count>            Number of threads/shards. Default: about 200 clients per shard
-        \\  --connect-rate <per-sec>    Connection rate per second. Default: 100
+        \\  --connect-rate <per-sec>    Connection rate per second; 0 disables the ramp and connects all clients at once. Default: 100
         \\  --username-prefix <prefix>  Prefix for client usernames. Default: "Zion"
         \\  --known-core-pack           Advertise minecraft:core for the compiled version
+        \\
+    );
+    // Feature order matches writeVersion: movement, broadcast, client-tick,
+    // diagnostics (stats and compression have no CLI flags).
+    if (comptime features.movement) try writer.writeAll(
+        \\  --movement <mode>           idle, rotate, or walk (bounded random walk). Default: idle
+        \\  --movement-ms <ms>          Active movement interval. Default: 50
+        \\  --movement-radius <blocks>  Walk radius. Default: 16
+        \\  --movement-speed <blocks/s> Walk speed. Default: 4.3
+        \\  --rotation-rate <degrees/s> Maximum turn rate. Default: 180
+        \\  --movement-seed <seed>      Deterministic movement seed. Default: 0
         \\
     );
     if (comptime features.broadcast) try writer.writeAll(
@@ -52,15 +63,6 @@ pub fn writeUsage(writer: *Io.Writer) !void {
     );
     if (comptime features.client_tick) try writer.writeAll(
         \\  --client-tick               Enable sending client tick packets every 50ms
-        \\
-    );
-    if (comptime features.movement) try writer.writeAll(
-        \\  --movement <mode>           idle, rotate, or bounded walk. Default: idle
-        \\  --movement-ms <ms>          Active movement interval. Default: 50
-        \\  --movement-radius <blocks>  Walk radius. Default: 16
-        \\  --movement-speed <blocks/s> Walk speed. Default: 4.3
-        \\  --rotation-rate <degrees/s> Maximum turn rate. Default: 180
-        \\  --movement-seed <seed>      Deterministic movement seed. Default: 0
         \\
     );
     if (comptime features.diagnostics) try writer.writeAll(
@@ -75,12 +77,20 @@ pub fn writeUsage(writer: *Io.Writer) !void {
 }
 
 pub fn writeVersion(writer: *Io.Writer) !void {
-    try writer.print("zion {s} (Minecraft Java {s}, protocol {d}; Zig {s}; features:", .{
+    // Snapshot protocol versions set bit 30; print the snapshot ordinal
+    // instead of the opaque combined number.
+    const snapshot_bit: i32 = 1 << 30;
+    const protocol_version = client.protocol.current.protocol_version;
+    try writer.print("zion {s} (Minecraft Java {s}, ", .{
         build_options.zion_version,
         client.protocol.current.minecraft_version,
-        client.protocol.current.protocol_version,
-        builtin.zig_version_string,
     });
+    if (comptime protocol_version & snapshot_bit != 0) {
+        try writer.print("protocol snapshot {d}", .{protocol_version & ~snapshot_bit});
+    } else {
+        try writer.print("protocol {d}", .{protocol_version});
+    }
+    try writer.print("; Zig {s}; features:", .{builtin.zig_version_string});
     if (comptime features.stats) try writer.writeAll(" stats");
     if (comptime features.compression) try writer.writeAll(" compression");
     if (comptime features.movement) try writer.writeAll(" movement");
@@ -189,12 +199,13 @@ pub fn writeStats(writer: *Io.Writer, stats: client_table.Stats) !void {
             @as(f64, @floatFromInt(diagnostics.keep_alive_send_total_ms)) /
                 @as(f64, @floatFromInt(diagnostics.keep_alive_send_samples));
         try writer.print(
-            "  diagnostics: recv_nobufs={d} cq_overflow={d} peak_cq={d}/{d} max_recv_bundle={d}B/{d} buffers\n" ++
+            "  diagnostics: recv_nobufs={d} cq_overflow={d} close_failures={d} peak_cq={d}/{d} max_recv_bundle={d}B/{d} buffers\n" ++
                 "  keepalive-send: samples={d} avg={d:.3}ms max={d}ms\n" ++
                 "  disconnects: server={d} transport={d} connect={d} buffer={d} protocol={d} resource={d} other={d}\n",
             .{
                 diagnostics.recv_nobufs,
                 diagnostics.cq_overflow,
+                diagnostics.close_failures,
                 diagnostics.max_cq_ready,
                 diagnostics.max_cq_entries,
                 diagnostics.max_recv_bundle_bytes,
@@ -288,6 +299,12 @@ test "writeVersion identifies the application and compiled protocol" {
     try std.testing.expect(std.mem.indexOf(u8, output, client.protocol.current.minecraft_version) != null);
     try std.testing.expect(std.mem.indexOf(u8, output, builtin.zig_version_string) != null);
     try std.testing.expect(std.mem.endsWith(u8, output, ")\n"));
+    if (comptime client.protocol.current.protocol_version & (1 << 30) != 0) {
+        try std.testing.expect(std.mem.indexOf(u8, output, "protocol snapshot ") != null);
+    } else {
+        try std.testing.expect(std.mem.indexOf(u8, output, "protocol snapshot") == null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "protocol ") != null);
+    }
 }
 
 test "writeTarget formats IPv6 and Unix handshake endpoints" {
@@ -325,6 +342,7 @@ test "writeStats includes client packet and traffic rates" {
         stats.diagnostics = .{
             .recv_nobufs = 3,
             .cq_overflow = 4,
+            .close_failures = 5,
             .max_cq_ready = 128,
             .max_cq_entries = 512,
             .max_recv_bundle_bytes = 8192,
@@ -345,7 +363,7 @@ test "writeStats includes client packet and traffic rates" {
         try std.testing.expect(std.mem.indexOf(u8, output, "counters: disabled at compile time") != null);
     }
     if (comptime stats_module.diagnostics_enabled) {
-        try std.testing.expect(std.mem.indexOf(u8, output, "recv_nobufs=3 cq_overflow=4 peak_cq=128/512 max_recv_bundle=8192B/2 buffers") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "recv_nobufs=3 cq_overflow=4 close_failures=5 peak_cq=128/512 max_recv_bundle=8192B/2 buffers") != null);
         try std.testing.expect(std.mem.indexOf(u8, output, "keepalive-send: samples=2 avg=3.500ms max=5ms") != null);
         try std.testing.expect(std.mem.indexOf(u8, output, "disconnects: server=1 transport=2 connect=0 buffer=0 protocol=0 resource=0 other=1") != null);
     }

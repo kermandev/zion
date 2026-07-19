@@ -7,11 +7,11 @@ pub const IndexedBot = struct {
 };
 
 pub const Stats = struct {
-    requested: usize = 0,
-    connected: usize = 0,
-    waiting: usize = 0,
-    connecting: usize = 0,
-    play: usize = 0,
+    requested: u64 = 0,
+    connected: u64 = 0,
+    waiting: u64 = 0,
+    connecting: u64 = 0,
+    play: u64 = 0,
     reconnects: u64 = 0,
     packets_received: u64 = 0,
     keep_alives_answered: u64 = 0,
@@ -38,13 +38,15 @@ pub const Stats = struct {
 pub fn collectStats(clients: *client.ClientTable) Stats {
     var stats: Stats = .{ .requested = clients.global_indices.items.len };
     const pool = clients.pool.slice();
+    const states = pool.items(.state);
+    const phases = clients.phases.items;
     for (0..clients.global_indices.items.len) |i| {
-        switch (pool.items(.state)[i]) {
+        switch (states[i]) {
             .waiting, .draining => stats.waiting += 1,
             .connecting => stats.connecting += 1,
             .connected => stats.connected += 1,
         }
-        if (clients.phases.items[i] == .play) stats.play += 1;
+        if (phases[i] == .play) stats.play += 1;
     }
     return stats;
 }
@@ -245,11 +247,11 @@ test "Stats.add aggregates shard counters without duration" {
     }
     stats.add(other);
 
-    try std.testing.expectEqual(@as(usize, 15), stats.requested);
-    try std.testing.expectEqual(@as(usize, 6), stats.connected);
-    try std.testing.expectEqual(@as(usize, 4), stats.waiting);
-    try std.testing.expectEqual(@as(usize, 5), stats.connecting);
-    try std.testing.expectEqual(@as(usize, 5), stats.play);
+    try std.testing.expectEqual(@as(u64, 15), stats.requested);
+    try std.testing.expectEqual(@as(u64, 6), stats.connected);
+    try std.testing.expectEqual(@as(u64, 4), stats.waiting);
+    try std.testing.expectEqual(@as(u64, 5), stats.connecting);
+    try std.testing.expectEqual(@as(u64, 5), stats.play);
     try std.testing.expectEqual(@as(u64, 9), stats.reconnects);
     try std.testing.expectEqual(@as(u64, 150), stats.packets_received);
     try std.testing.expectEqual(@as(u64, 8), stats.keep_alives_answered);
@@ -285,11 +287,11 @@ test "collectStats aggregates hot columns from client table" {
     clients.getPhase(1).* = .login;
 
     const stats = collectStats(&clients);
-    try std.testing.expectEqual(@as(usize, 3), stats.requested);
-    try std.testing.expectEqual(@as(usize, 1), stats.connected);
-    try std.testing.expectEqual(@as(usize, 1), stats.connecting);
-    try std.testing.expectEqual(@as(usize, 1), stats.waiting);
-    try std.testing.expectEqual(@as(usize, 1), stats.play);
+    try std.testing.expectEqual(@as(u64, 3), stats.requested);
+    try std.testing.expectEqual(@as(u64, 1), stats.connected);
+    try std.testing.expectEqual(@as(u64, 1), stats.connecting);
+    try std.testing.expectEqual(@as(u64, 1), stats.waiting);
+    try std.testing.expectEqual(@as(u64, 1), stats.play);
 }
 
 test "initialConnectOffsetMs ramps initial connection attempts" {
