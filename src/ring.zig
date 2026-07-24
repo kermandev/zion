@@ -8,13 +8,30 @@ pub const max_ring_entries: u16 = 32768;
 pub const min_recv_buffers: u16 = 64;
 pub const max_recv_buffers: u16 = 256;
 pub const bundled_min_recv_buffers: u16 = 512;
-pub const bundled_max_recv_buffers: u16 = 1024;
+// The provided-buffer ring is shared by every client on a shard and is only
+// replenished after userspace retires each completion, so it must be sized well
+// above the client count or bursts drain it and recv completions start failing
+// with ENOBUFS. Scale with the client count up to this ceiling (64 MiB of 4 KiB
+// buffers) instead of flatlining at a low cap.
+pub const bundled_max_recv_buffers: u16 = 16384;
 pub const ordinary_recv_buffer_size: u32 = 16 * 1024;
 pub const bundled_recv_buffer_size: u32 = 4 * 1024;
 pub const completion_batch_size: u32 = 32;
 pub const completion_batch_wait_us: u32 = 50;
 
-const IORING_FEAT_EXT_ARG: u32 = 1 << 8;
+// Set once per process to the shared stop flag so the blocking retry loops here
+// can bail on a pending shutdown instead of spinning on repeated EINTR.
+var stop_signal: ?*const std.atomic.Value(bool) = null;
+
+pub fn setStopSignal(flag: *const std.atomic.Value(bool)) void {
+    stop_signal = flag;
+}
+
+fn stopRequested() bool {
+    return if (stop_signal) |flag| flag.load(.monotonic) else false;
+}
+
+// Feature bits std.os.linux does not define yet.
 const IORING_FEAT_RECVSEND_BUNDLE: u32 = 1 << 14;
 const IORING_FEAT_MIN_TIMEOUT: u32 = 1 << 15;
 
@@ -42,20 +59,28 @@ pub const CompletionKey = struct {
     index: usize,
 };
 
+/// Bit layout of an SQE `user_data` word.
+const PackedKey = packed struct(u64) {
+    index: u40,
+    generation: u16,
+    kind: u8,
+};
+
 pub fn packCompletionKey(key: CompletionKey) u64 {
-    std.debug.assert(key.index <= 0x00ff_ffff_ffff);
-    return (@as(u64, @intFromEnum(key.kind)) << 56) |
-        (@as(u64, key.generation) << 40) |
-        @as(u64, @intCast(key.index));
+    std.debug.assert(key.index <= std.math.maxInt(u40));
+    return @bitCast(PackedKey{
+        .index = @intCast(key.index),
+        .generation = key.generation,
+        .kind = @intFromEnum(key.kind),
+    });
 }
 
 pub fn unpackCompletionKey(value: u64) ?CompletionKey {
-    const raw_kind: u8 = @intCast(value >> 56);
-    const kind = std.enums.fromInt(CompletionKind, raw_kind) orelse return null;
+    const key: PackedKey = @bitCast(value);
     return .{
-        .kind = kind,
-        .generation = @intCast((value >> 40) & 0xffff),
-        .index = @intCast(value & 0x00ff_ffff_ffff),
+        .kind = std.enums.fromInt(CompletionKind, key.kind) orelse return null,
+        .generation = key.generation,
+        .index = key.index,
     };
 }
 
@@ -73,7 +98,7 @@ pub fn openUring(client_count: usize) !IoUring {
     errdefer ring.deinit();
     // Timed waits rely on IORING_ENTER_EXT_ARG unconditionally; the feature
     // exists since kernel 5.11, far below the documented 6.7 kernel floor.
-    if ((ring.features & IORING_FEAT_EXT_ARG) == 0) return error.IoUringExtArgUnsupported;
+    if ((ring.features & linux.IORING_FEAT_EXT_ARG) == 0) return error.IoUringExtArgUnsupported;
     return ring;
 }
 
@@ -95,9 +120,8 @@ pub fn recvBufferCount(client_count: usize) u16 {
 }
 
 fn boundedPowerOfTwo(wanted: usize, minimum: u16, maximum: u16) u16 {
-    const clamped = std.math.clamp(wanted, @as(usize, minimum), @as(usize, maximum));
-    const rounded = std.math.ceilPowerOfTwo(usize, clamped) catch @as(usize, maximum);
-    return @intCast(@min(rounded, @as(usize, maximum)));
+    const clamped = std.math.clamp(wanted, minimum, maximum);
+    return @min(std.math.ceilPowerOfTwoAssert(usize, clamped), maximum);
 }
 
 pub const RecvLayout = struct {
@@ -168,13 +192,7 @@ pub const RecvBufferGroup = struct {
         errdefer allocator.free(buffers);
         const br = try IoUring.setup_buf_ring(ring.fd, layout.buffer_count, group_id, .{ .inc = false });
         IoUring.buf_ring_init(br);
-        const mask = IoUring.buf_ring_mask(layout.buffer_count);
-        for (0..layout.buffer_count) |id| {
-            const start = @as(usize, layout.buffer_size) * id;
-            IoUring.buf_ring_add(br, buffers[start .. start + layout.buffer_size], @intCast(id), mask, @intCast(id));
-        }
-        IoUring.buf_ring_advance(br, layout.buffer_count);
-        return .{
+        const group: RecvBufferGroup = .{
             .ring = ring,
             .br = br,
             .buffers = buffers,
@@ -183,6 +201,12 @@ pub const RecvBufferGroup = struct {
             .group_id = group_id,
             .bundled = layout.bundled,
         };
+        const mask = IoUring.buf_ring_mask(layout.buffer_count);
+        for (0..layout.buffer_count) |id| {
+            IoUring.buf_ring_add(br, group.bufferAt(@intCast(id)), @intCast(id), mask, @intCast(id));
+        }
+        IoUring.buf_ring_advance(br, layout.buffer_count);
+        return group;
     }
 
     pub fn deinit(self: *RecvBufferGroup, allocator: std.mem.Allocator) void {
@@ -191,7 +215,7 @@ pub const RecvBufferGroup = struct {
         self.* = undefined;
     }
 
-    pub fn recvMultishotFixed(self: *RecvBufferGroup, user_data: u64, slot: u32) !*linux.io_uring_sqe {
+    pub fn recvMultishotFixed(self: *const RecvBufferGroup, user_data: u64, slot: u32) !*linux.io_uring_sqe {
         const sqe = try self.ring.get_sqe();
         sqe.prep_rw(.RECV, @intCast(slot), 0, 0, 0);
         sqe.flags |= linux.IOSQE_BUFFER_SELECT | linux.IOSQE_FIXED_FILE;
@@ -206,18 +230,21 @@ pub const RecvBufferGroup = struct {
         return RecvBatch.init(try event.buffer_id(), @intCast(event.res), self.buffer_size, self.buffer_count);
     }
 
-    pub fn bytes(self: *RecvBufferGroup, slice: RecvSlice) []u8 {
-        const start = @as(usize, self.buffer_size) * slice.buffer_id;
-        return self.buffers[start .. start + slice.len];
+    fn bufferAt(self: *const RecvBufferGroup, buffer_id: u16) []u8 {
+        const start = @as(usize, self.buffer_size) * buffer_id;
+        return self.buffers[start..][0..self.buffer_size];
     }
 
-    pub fn releaseBatch(self: *RecvBufferGroup, batch_value: RecvBatch) void {
+    pub fn bytes(self: *const RecvBufferGroup, slice: RecvSlice) []u8 {
+        return self.bufferAt(slice.buffer_id)[0..slice.len];
+    }
+
+    pub fn releaseBatch(self: *const RecvBufferGroup, batch_value: RecvBatch) void {
         var iterator = batch_value;
         const mask = IoUring.buf_ring_mask(self.buffer_count);
         var released: u16 = 0;
         while (iterator.next()) |slice| {
-            const start = @as(usize, self.buffer_size) * slice.buffer_id;
-            IoUring.buf_ring_add(self.br, self.buffers[start .. start + self.buffer_size], slice.buffer_id, mask, released);
+            IoUring.buf_ring_add(self.br, self.bufferAt(slice.buffer_id), slice.buffer_id, mask, released);
             released += 1;
         }
         if (released > 0) IoUring.buf_ring_advance(self.br, released);
@@ -232,19 +259,6 @@ pub fn timeoutTimespec(timeout_ms: i32) linux.kernel_timespec {
     };
 }
 
-fn retryUring(should_stop: *const std.atomic.Value(bool), ring: *IoUring, comptime action: enum { submit, submit_and_wait }) !u32 {
-    while (true) {
-        const res = switch (action) {
-            .submit => ring.submit(),
-            .submit_and_wait => ring.submit_and_wait(1),
-        } catch |err| switch (err) {
-            error.SignalInterrupt => if (should_stop.load(.monotonic)) return 0 else continue,
-            else => return err,
-        };
-        return res;
-    }
-}
-
 pub fn waitForUringEvents(ring: *IoUring, timeout_ms: i32, should_stop: *const std.atomic.Value(bool)) !void {
     // Ready completions are drained immediately; the 50us min-timeout batching
     // only applies while idle, as a wakeup coalescing window. EXT_ARG support
@@ -253,7 +267,7 @@ pub fn waitForUringEvents(ring: *IoUring, timeout_ms: i32, should_stop: *const s
         try submitAndRunTaskWork(ring, should_stop);
         return;
     }
-    try submitAndWaitTimed(ring, timeout_ms, true, should_stop);
+    try submitAndWaitTimed(ring, timeout_ms, should_stop);
 }
 
 fn submitAndRunTaskWork(ring: *IoUring, should_stop: *const std.atomic.Value(bool)) !void {
@@ -267,8 +281,8 @@ fn submitAndRunTaskWork(ring: *IoUring, should_stop: *const std.atomic.Value(boo
     }
 }
 
-fn submitAndWaitTimed(ring: *IoUring, timeout_ms: i32, batch_ready: bool, should_stop: *const std.atomic.Value(bool)) !void {
-    const use_min_timeout = batch_ready and (ring.features & IORING_FEAT_MIN_TIMEOUT) != 0;
+fn submitAndWaitTimed(ring: *IoUring, timeout_ms: i32, should_stop: *const std.atomic.Value(bool)) !void {
+    const use_min_timeout = (ring.features & IORING_FEAT_MIN_TIMEOUT) != 0;
     var timeout = timeoutTimespec(timeout_ms);
     var args: GetEventsArg = .{
         .min_wait_usec = if (use_min_timeout) completion_batch_wait_us else 0,
@@ -313,7 +327,13 @@ pub fn copyReadyCqes(ring: *IoUring, events: []linux.io_uring_cqe, should_stop: 
 }
 
 pub fn submitNoWait(ring: *IoUring, should_stop: *const std.atomic.Value(bool)) !void {
-    _ = try retryUring(should_stop, ring, .submit);
+    while (true) {
+        _ = ring.submit() catch |err| switch (err) {
+            error.SignalInterrupt => if (should_stop.load(.monotonic)) return else continue,
+            else => return err,
+        };
+        return;
+    }
 }
 
 pub fn registerFixedFiles(ring: *IoUring, count: usize) !void {
@@ -353,7 +373,12 @@ pub fn queueConfigureAndConnectFixed(
     // Non-positive buffer sizes leave the socket on kernel autotuning.
     const set_rcvbuf = receive_buffer_bytes.* > 0;
     const set_sndbuf = send_buffer_bytes.* > 0;
-    const option_count: u32 = 1 + @intFromBool(set_rcvbuf) + @intFromBool(set_sndbuf) + @intFromBool(tcp);
+    // One SQE for the connect, plus one per option actually set. Summing
+    // @intFromBool results directly would do the arithmetic in u1 and overflow.
+    var option_count: u32 = 1;
+    if (set_rcvbuf) option_count += 1;
+    if (set_sndbuf) option_count += 1;
+    if (tcp) option_count += 1;
     try ensureSqeCapacity(ring, option_count);
     if (set_rcvbuf) try queueFixedSocketOption(ring, option_user_data, slot, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(receive_buffer_bytes));
     if (set_sndbuf) try queueFixedSocketOption(ring, option_user_data, slot, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(send_buffer_bytes));
@@ -383,8 +408,8 @@ pub fn queueSendMsgFixed(ring: *IoUring, user_data: u64, slot: u32, msg: *const 
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
-pub fn queueRecvMultishotFixed(ring: *IoUring, recv_buffers: *RecvBufferGroup, user_data: u64, slot: u32) !void {
-    try ensureSqeCapacity(ring, 1);
+pub fn queueRecvMultishotFixed(recv_buffers: *const RecvBufferGroup, user_data: u64, slot: u32) !void {
+    try ensureSqeCapacity(recv_buffers.ring, 1);
     _ = try recv_buffers.recvMultishotFixed(user_data, slot);
 }
 
@@ -400,7 +425,10 @@ fn ensureSqeCapacity(ring: *IoUring, needed: u32) !void {
     if (ring.sq_ready() + needed <= ring.sq.sqes.len) return;
     while (true) {
         _ = ring.submit() catch |err| switch (err) {
-            error.SignalInterrupt => continue,
+            // Every other retry site checks the stop flag; this one used to
+            // continue unconditionally, so a SIGINT that landed inside a submit
+            // during a full-SQ storm was swallowed and Ctrl-C appeared dead.
+            error.SignalInterrupt => if (stopRequested()) return else continue,
             else => return err,
         };
         return;

@@ -45,7 +45,7 @@ pub fn PacketWriter(comptime Backend: type) type {
             return .{ .backend = backend };
         }
 
-        fn writeAll(packet: *Self, value: []const u8) WriteError!void {
+        fn writeAll(packet: Self, value: []const u8) WriteError!void {
             if (comptime Backend == Io.Writer.Allocating) {
                 try packet.backend.ensureUnusedCapacity(value.len);
                 const writer = &packet.backend.writer;
@@ -56,53 +56,49 @@ pub fn PacketWriter(comptime Backend: type) type {
             }
         }
 
-        fn writeInt(packet: *Self, comptime T: type, value: T) WriteError!void {
-            if (comptime Backend == Io.Writer) {
-                try packet.backend.writeInt(T, value, .big);
-            } else {
-                var encoded: [@divExact(@typeInfo(T).int.bits, 8)]u8 = undefined;
-                std.mem.writeInt(T, &encoded, value, .big);
-                try packet.writeAll(&encoded);
-            }
+        fn writeInt(packet: Self, comptime T: type, value: T) WriteError!void {
+            var encoded: [@divExact(@typeInfo(T).int.bits, 8)]u8 = undefined;
+            std.mem.writeInt(T, &encoded, value, .big);
+            try packet.writeAll(&encoded);
         }
 
-        pub fn writeBool(packet: *Self, value: bool) WriteError!void {
-            try packet.writeByte(if (value) 1 else 0);
+        pub fn writeBool(packet: Self, value: bool) WriteError!void {
+            try packet.writeByte(@intFromBool(value));
         }
 
-        pub fn writeByte(packet: *Self, value: u8) WriteError!void {
+        pub fn writeByte(packet: Self, value: u8) WriteError!void {
             try packet.writeAll(&.{value});
         }
 
-        pub fn writeBytes(packet: *Self, value: []const u8) WriteError!void {
+        pub fn writeBytes(packet: Self, value: []const u8) WriteError!void {
             try packet.writeAll(value);
         }
 
-        pub fn writeI32(packet: *Self, value: i32) WriteError!void {
+        pub fn writeI32(packet: Self, value: i32) WriteError!void {
             try packet.writeInt(i32, value);
         }
 
-        pub fn writeF32(packet: *Self, value: f32) WriteError!void {
+        pub fn writeF32(packet: Self, value: f32) WriteError!void {
             try packet.writeI32(@bitCast(value));
         }
 
-        pub fn writeF64(packet: *Self, value: f64) WriteError!void {
+        pub fn writeF64(packet: Self, value: f64) WriteError!void {
             try packet.writeI64(@bitCast(value));
         }
 
-        pub fn writeU16(packet: *Self, value: u16) WriteError!void {
+        pub fn writeU16(packet: Self, value: u16) WriteError!void {
             try packet.writeInt(u16, value);
         }
 
-        pub fn writeI64(packet: *Self, value: i64) WriteError!void {
+        pub fn writeI64(packet: Self, value: i64) WriteError!void {
             try packet.writeInt(i64, value);
         }
 
-        pub fn writeUuid(packet: *Self, value: [16]u8) WriteError!void {
+        pub fn writeUuid(packet: Self, value: [16]u8) WriteError!void {
             try packet.writeAll(&value);
         }
 
-        pub fn writeVarInt(packet: *Self, value: i32) WriteError!void {
+        pub fn writeVarInt(packet: Self, value: i32) WriteError!void {
             var encoded: [5]u8 = undefined;
             var unsigned: u32 = @bitCast(value);
             var len: usize = 0;
@@ -115,7 +111,7 @@ pub fn PacketWriter(comptime Backend: type) type {
             try packet.writeAll(encoded[0 .. len + 1]);
         }
 
-        pub fn writeString(packet: *Self, value: []const u8, comptime max_chars: usize) Error!void {
+        pub fn writeString(packet: Self, value: []const u8, comptime max_chars: usize) Error!void {
             const chars = std.unicode.utf8CountCodepoints(value) catch return error.StringTooLong;
             if (chars > max_chars) return error.StringTooLong;
             try packet.writeVarInt(@intCast(value.len));
@@ -125,25 +121,21 @@ pub fn PacketWriter(comptime Backend: type) type {
 }
 
 pub const PacketFrame = struct {
-    buffer: *Io.Writer.Allocating,
     writer: PacketWriter(Io.Writer.Allocating),
 
     pub fn init(buffer: *Io.Writer.Allocating, packet_id: i32) std.mem.Allocator.Error!PacketFrame {
         buffer.clearRetainingCapacity();
-        var frame: PacketFrame = .{
-            .buffer = buffer,
-            .writer = .init(buffer),
-        };
+        var frame: PacketFrame = .{ .writer = .init(buffer) };
         try frame.writer.writeVarInt(packet_id);
         return frame;
     }
 
     pub fn packetData(frame: *const PacketFrame) []const u8 {
-        return frame.buffer.written();
+        return frame.writer.backend.written();
     }
 
     pub fn finish(frame: *PacketFrame, compression: Compression) PacketError![]u8 {
-        const allocator = frame.buffer.allocator;
+        const allocator = frame.writer.backend.allocator;
         var out: Io.Writer.Allocating = .init(allocator);
         errdefer out.deinit();
         try appendPacketFrame(allocator, &out, frame.packetData(), compression, null, null);
@@ -151,20 +143,20 @@ pub const PacketFrame = struct {
     }
 
     pub fn takePacketData(frame: *PacketFrame) std.mem.Allocator.Error![]u8 {
-        return try frame.buffer.toOwnedSlice();
+        return try frame.writer.backend.toOwnedSlice();
     }
 };
 
 pub fn appendPacketFrame(
     allocator: std.mem.Allocator,
-    out: anytype,
+    out: *Io.Writer.Allocating,
     packet_data: []const u8,
     compression: Compression,
     compress_buf: ?*std.ArrayList(u8),
     compress_window: ?[]u8,
 ) PacketError!void {
-    var packet = PacketWriter(@TypeOf(out.*)).init(out);
     if (packet_data.len > max_packet_len) return error.PacketTooLarge;
+    var packet: PacketWriter(Io.Writer.Allocating) = .init(out);
     const threshold = compression.threshold() orelse {
         try packet.writeVarInt(@intCast(packet_data.len));
         try packet.writeBytes(packet_data);
@@ -186,13 +178,10 @@ pub fn appendPacketFrame(
     defer local_buf.deinit(allocator);
     const buf = compress_buf orelse &local_buf;
 
-    const owned_window: ?[]u8 = if (compress_window == null)
-        try allocator.alloc(u8, std.compress.flate.max_window_len)
-    else
-        null;
-    defer if (owned_window) |window| allocator.free(window);
+    const window = compress_window orelse try allocator.alloc(u8, std.compress.flate.max_window_len);
+    defer if (compress_window == null) allocator.free(window);
 
-    try compressPacketInto(allocator, buf, packet_data, compress_window orelse owned_window.?);
+    try compressPacketInto(allocator, buf, packet_data, window);
 
     const data_len_len = varIntLen(@intCast(packet_data.len));
     try packet.writeVarInt(@intCast(data_len_len + buf.items.len));
@@ -214,41 +203,45 @@ pub const PacketReader = struct {
         return .{ .reader = reader };
     }
 
-    pub fn readI32(self: *PacketReader) Io.Reader.Error!i32 {
+    pub fn readI32(self: PacketReader) Io.Reader.Error!i32 {
         return self.reader.takeInt(i32, .big);
     }
 
-    pub fn readI64(self: *PacketReader) Io.Reader.Error!i64 {
+    pub fn readI64(self: PacketReader) Io.Reader.Error!i64 {
         return self.reader.takeInt(i64, .big);
     }
 
-    pub fn readF32(self: *PacketReader) Io.Reader.Error!f32 {
+    pub fn readF32(self: PacketReader) Io.Reader.Error!f32 {
         return @bitCast(try self.readI32());
     }
 
-    pub fn readF64(self: *PacketReader) Io.Reader.Error!f64 {
+    pub fn readF64(self: PacketReader) Io.Reader.Error!f64 {
         return @bitCast(try self.readI64());
     }
 
-    pub fn readUuid(self: *PacketReader) Io.Reader.Error![16]u8 {
+    pub fn readUuid(self: PacketReader) Io.Reader.Error![16]u8 {
         return (try self.reader.takeArray(16)).*;
     }
 
-    pub fn readVarInt(self: *PacketReader) VarIntError!i32 {
-        var value: u32 = 0;
-        var shift: u5 = 0;
+    /// A decoded VarInt plus the number of bytes it occupied. Encodings may be
+    /// non-canonical, so the length cannot be derived from the value.
+    pub const VarInt = struct { value: i32, len: usize };
 
+    pub fn readVarIntSized(self: PacketReader) VarIntError!VarInt {
+        var value: u32 = 0;
         for (0..5) |i| {
             const byte = try self.reader.takeByte();
-            value |= @as(u32, byte & 0x7f) << shift;
-            if ((byte & 0x80) == 0) return @bitCast(value);
-            if (i == 4) break;
-            shift += 7;
+            value |= @as(u32, byte & 0x7f) << @intCast(i * 7);
+            if ((byte & 0x80) == 0) return .{ .value = @bitCast(value), .len = i + 1 };
         }
         return error.VarIntTooLong;
     }
 
-    pub fn readString(self: *PacketReader, comptime max_chars: usize) Error![]const u8 {
+    pub fn readVarInt(self: PacketReader) VarIntError!i32 {
+        return (try self.readVarIntSized()).value;
+    }
+
+    pub fn readString(self: PacketReader, comptime max_chars: usize) Error![]const u8 {
         const len = try self.readVarInt();
         if (len < 0) return error.NegativeLength;
         const usize_len: usize = @intCast(len);
@@ -348,35 +341,21 @@ pub fn readCompressedPacket(
     var input: Io.Reader = .fixed(compressed);
     var decompress: std.compress.flate.Decompress = .init(&input, .zlib, window);
 
-    // Decode the id VarInt off the decompressed stream, tracking how many
-    // bytes it actually occupied (it may be non-canonically encoded).
-    var unsigned: u32 = 0;
-    var id_len: usize = 0;
-    var shift: u5 = 0;
-    while (true) {
-        const byte = decompress.reader.takeByte() catch return error.MalformedPacket;
-        unsigned |= @as(u32, byte & 0x7f) << shift;
-        id_len += 1;
-        if ((byte & 0x80) == 0) break;
-        if (id_len == 5) return error.VarIntTooLong;
-        shift += 7;
-    }
-    const id: i32 = @bitCast(unsigned);
-    if (!isHandled(id)) return null;
+    var packet_reader: PacketReader = .init(&decompress.reader);
+    const id = packet_reader.readVarIntSized() catch |err| switch (err) {
+        error.VarIntTooLong => return error.VarIntTooLong,
+        error.ReadFailed, error.EndOfStream => return error.MalformedPacket,
+    };
+    if (!isHandled(id.value)) return null;
 
-    if (data_len < id_len) return error.MalformedPacket;
-    const payload_len = data_len - id_len;
+    if (data_len < id.len) return error.MalformedPacket;
+    const payload_len = data_len - id.len;
     try decomp_buf.resize(allocator, payload_len);
     var fixed: Io.Writer = .fixed(decomp_buf.items);
     decompress.reader.streamExact(&fixed, payload_len) catch return error.MalformedPacket;
 
-    var discard_buffer: [1024]u8 = undefined;
-    var discard: Io.Writer.Discarding = .init(&discard_buffer);
-    const extra = decompress.reader.streamRemaining(&discard.writer) catch return error.MalformedPacket;
-    if (extra != 0) return error.MalformedPacket;
-    if (input.seek != input.end) return error.MalformedPacket;
-
-    return .{ .id = id, .payload = decomp_buf.items };
+    try expectStreamEnd(&decompress.reader, &input);
+    return .{ .id = id.value, .payload = decomp_buf.items };
 }
 
 pub const Compression = if (compression_enabled) union(enum) {
@@ -430,13 +409,18 @@ fn decompressPacketInto(compressed: []const u8, out: []u8, window: []u8) PacketE
     var fixed: Io.Writer = .fixed(out);
     decompress.reader.streamExact(&fixed, out.len) catch return error.MalformedPacket;
 
+    try expectStreamEnd(&decompress.reader, &input);
+    return out;
+}
+
+/// The frame must decode to exactly the expected bytes: no trailing
+/// decompressed output and no unconsumed compressed input.
+fn expectStreamEnd(decompressed: *Io.Reader, input: *const Io.Reader) PacketError!void {
     var discard_buffer: [1024]u8 = undefined;
     var discard: Io.Writer.Discarding = .init(&discard_buffer);
-    const extra = decompress.reader.streamRemaining(&discard.writer) catch return error.MalformedPacket;
+    const extra = decompressed.streamRemaining(&discard.writer) catch return error.MalformedPacket;
     if (extra != 0) return error.MalformedPacket;
     if (input.seek != input.end) return error.MalformedPacket;
-
-    return out;
 }
 
 fn validateZlibHeader(compressed: []const u8) PacketError!void {

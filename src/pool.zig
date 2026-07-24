@@ -53,6 +53,7 @@ const queueShutdownAndCloseFixed = ring_module.queueShutdownAndCloseFixed;
 const queuePollOut = ring_module.queuePollOut;
 
 var stop_requested = std.atomic.Value(bool).init(false);
+var stop_signal_count = std.atomic.Value(u32).init(0);
 
 pub const stats_enabled = stats_module.stats_enabled;
 const diagnostics_enabled = stats_module.diagnostics_enabled;
@@ -69,6 +70,7 @@ pub const Options = struct {
     client_tick_packet: if (features.client_tick) ?client.CachedPacket else void = if (features.client_tick) null else {},
     movement: if (features.movement) client.MovementConfig else void = if (features.movement) .{} else {},
     connect_rate_per_sec: u32 = 100,
+    reconnect: bool = features.reconnect,
     username_prefix: []const u8 = "Zion",
     known_core_pack: bool = false,
     join_progress: ?*JoinProgress = null,
@@ -114,6 +116,7 @@ const LoopContext = struct {
     socket_receive_buffer_bytes: i32 = endpoint.socket_receive_buffer_bytes,
     socket_send_buffer_bytes: i32 = endpoint.socket_send_buffer_bytes,
     tcp_nodelay: i32 = 1,
+    reconnect: bool = features.reconnect,
     aggregate: Stats = .{},
 };
 
@@ -125,6 +128,8 @@ pub fn run(
     options: Options,
 ) !Stats {
     stop_requested.store(false, .monotonic);
+    stop_signal_count.store(0, .monotonic);
+    ring_module.setStopSignal(&stop_requested);
     if (!builtin.is_test) installSignalHandlers();
     const started_ms = monotonicMs(io);
 
@@ -226,9 +231,16 @@ fn runShardLoop(
     try clients.ensureTotalCapacity(allocator, bots.len);
 
     const now = monotonicMs(io);
+    if (comptime features.reconnect) {
+        // Distinct seed per shard (clock plus the shard's first global index and
+        // size) so shards do not jitter their reconnects in phase with each other.
+        const seed_index: u64 = if (bots.len > 0) bots[0].global_index else 0;
+        clients.reconnect_prng = std.Random.DefaultPrng.init(now ^ (seed_index << 32) ^ bots.len);
+    }
     for (bots) |bot| {
-        const i: usize = bot.global_index;
-        const next_attempt_ms = now +| client_table.initialConnectOffsetMs(i, options.connect_rate_per_sec);
+        // Keyed to the global index, not the shard-local slot, so the whole
+        // fleet ramps at connect_rate_per_sec instead of once per shard.
+        const next_attempt_ms = now +| client_table.initialConnectOffsetMs(bot.global_index, options.connect_rate_per_sec);
         clients.appendAssumeCapacity(bot.global_index, next_attempt_ms);
     }
 
@@ -283,7 +295,7 @@ fn runShardLoop(
     defer allocator.free(send_iovecs);
     const send_msghdrs = try allocator.alloc(linux.msghdr_const, bots.len);
     defer allocator.free(send_msghdrs);
-    for (0..bots.len) |i| scheduler.schedule(i, clients.pool.slice().items(.next_attempt_ms)[i]);
+    for (clients.pool.items(.next_attempt_ms), 0..) |deadline_ms, i| scheduler.schedule(i, deadline_ms);
 
     var connect_address: PosixAddress = undefined;
     const connect_address_length = addressToPosix(&resolved_target.address, &connect_address);
@@ -303,6 +315,7 @@ fn runShardLoop(
         .connect_address_length = connect_address_length,
         .send_iovecs = send_iovecs,
         .send_msghdrs = send_msghdrs,
+        .reconnect = features.reconnect and options.reconnect,
     };
     if (comptime diagnostics_enabled) ctx.aggregate.diagnostics.observeCq(0, @intCast(ring.cq.cqes.len));
 
@@ -315,6 +328,9 @@ fn runShardLoop(
             ctx.aggregate.diagnostics.observeCq(ring.cq_ready(), @intCast(ring.cq.cqes.len));
         }
         const ready = try copyReadyCqes(&ring, events, &stop_requested);
+        // Bail before retiring a large completion batch so a shutdown request
+        // observed mid-iteration cannot be delayed behind thousands of events.
+        if (shouldStop()) break;
 
         loop_now = monotonicMs(io);
         // A receive heavy server can keep thousands of multishot CQEs ready.
@@ -323,12 +339,12 @@ fn runShardLoop(
         for (events[0..ready]) |event| {
             const key = unpackCompletionKey(event.user_data) orelse continue;
             if (key.kind == .recv) continue;
-            try processUringEvent(&ctx, event, loop_now, progress);
+            try processUringEvent(&ctx, event, key, loop_now, progress);
         }
         for (events[0..ready]) |event| {
             const key = unpackCompletionKey(event.user_data) orelse continue;
             if (key.kind != .recv) continue;
-            try processUringEvent(&ctx, event, loop_now, progress);
+            try processUringEvent(&ctx, event, key, loop_now, progress);
         }
         trimScratchBuffers(&ctx);
     }
@@ -348,7 +364,7 @@ fn runShardLoop(
     return stats;
 }
 
-fn trimScratchBuffers(ctx: *LoopContext) void {
+fn trimScratchBuffers(ctx: *const LoopContext) void {
     if (comptime client.protocol.compression_enabled) {
         if (ctx.decompress_buf.capacity > max_retained_decompression_bytes) {
             ctx.decompress_buf.clearAndFree(ctx.clients.allocator);
@@ -369,24 +385,17 @@ fn driveConnectedClient(
     progress: ProgressSink,
 ) !void {
     if (!ctx.clients.pool.slice().items(.flags)[i].socket_live) return;
-    const phase = ctx.clients.phases.items[i];
-    if (phase != .play) return;
+    const phase = ctx.clients.getPhase(i);
+    if (phase.* != .play) return;
 
-    const t = client.nextTimerMs(ctx.clients, i, phase) orelse return;
-    if (now_ms < t) {
-        return;
-    }
+    const deadline_ms = client.nextTimerMs(ctx.clients, i, phase.*) orelse return;
+    if (now_ms < deadline_ms) return;
 
-    const phase_ref = ctx.clients.getPhase(i);
-    const wrote = client.onTimerFor(movement_profile, ctx.clients, i, phase_ref, now_ms, ctx.packet_builder_buf, ctx.write_temp_buf) catch |err| {
+    const wrote = client.onTimerFor(movement_profile, ctx.clients, i, phase, now_ms, ctx.packet_builder_buf, ctx.write_temp_buf) catch |err| {
         try failRuntime(ctx, i, err, now_ms, progress);
         return;
     };
-
-    if (wrote) {
-        try armSend(ctx, i);
-    }
-
+    if (wrote) try armSend(ctx, i);
     scheduleClient(ctx, i);
 }
 
@@ -402,16 +411,18 @@ fn driveDueClients(
         const i: usize = raw_index;
         switch (ctx.clients.pool.slice().items(.state)[i]) {
             .waiting => {
-                startConnect(ctx, i, now_ms) catch |err| try failRuntime(ctx, i, err, now_ms, progress);
+                startConnect(ctx, i) catch |err| try failRuntime(ctx, i, err, now_ms, progress);
                 scheduleClient(ctx, i);
             },
-            .connecting, .draining => {},
+            .connecting, .draining, .stopped => {},
             .connected => try driveConnectedClient(movement_profile, ctx, i, now_ms, progress),
         }
     }
 }
 
-fn driveDueClientsConfigured(
+// `noinline`: the inline-else below fans out into one copy of the whole timer
+// path per movement profile, and inlining that into runShardLoop doubled it.
+noinline fn driveDueClientsConfigured(
     ctx: *LoopContext,
     now_ms: u64,
     progress: ProgressSink,
@@ -429,32 +440,25 @@ fn driveDueClientsConfigured(
 fn processUringEvent(
     ctx: *LoopContext,
     event: linux.io_uring_cqe,
+    key: CompletionKey,
     now_ms: u64,
     progress: ProgressSink,
 ) !void {
-    const key = unpackCompletionKey(event.user_data) orelse return;
     switch (key.kind) {
-        .timeout => return,
-        .recv => {
-            try handleRecvReady(ctx, event, key, now_ms, progress);
-            return;
-        },
-        .send => {
-            try handleSendReady(ctx, event, key, now_ms, progress);
-            return;
-        },
+        .timeout, .socket_option => {},
+        .recv => try handleRecvReady(ctx, event, key, now_ms, progress),
+        .send => try handleSendReady(ctx, event, key, now_ms, progress),
         .connect => try handleConnectReady(ctx, event, key, now_ms, progress),
         .socket => try handleSocketReady(ctx, event, key, now_ms, progress),
-        .socket_option => return,
         .close => handleCloseReady(ctx, event, key),
         .poll => try handlePollReady(ctx, event, key, now_ms, progress),
     }
 }
 
 fn handleSocketReady(ctx: *LoopContext, event: linux.io_uring_cqe, key: CompletionKey, now_ms: u64, progress: ProgressSink) !void {
-    if (key.index >= ctx.clients.global_indices.items.len) return;
-    const pool = ctx.clients.pool.slice();
     const index = key.index;
+    if (index >= ctx.clients.global_indices.items.len) return;
+    const pool = ctx.clients.pool.slice();
     if (key.generation != pool.items(.connect_generation)[index] or pool.items(.state)[index] != .connecting) return;
 
     if (event.err() != .SUCCESS) {
@@ -467,10 +471,11 @@ fn handleSocketReady(ctx: *LoopContext, event: linux.io_uring_cqe, key: Completi
         .ip => true,
         .unix => false,
     };
+    // The guard above proved key.generation is the live connect generation.
     queueConfigureAndConnectFixed(
         ctx.ring,
-        packCompletionKey(.{ .kind = .socket_option, .generation = pool.items(.connect_generation)[index], .index = index }),
-        packCompletionKey(.{ .kind = .connect, .generation = pool.items(.connect_generation)[index], .index = index }),
+        packCompletionKey(.{ .kind = .socket_option, .generation = key.generation, .index = index }),
+        packCompletionKey(.{ .kind = .connect, .generation = key.generation, .index = index }),
         @intCast(index),
         tcp,
         &ctx.socket_receive_buffer_bytes,
@@ -690,7 +695,7 @@ fn handleSendReady(
 // Arms a POLLOUT keyed to the current send generation. The completion is only
 // acted on if the generation still matches: any intervening send re-arm or
 // reconnect bumps send_generation and makes the poll a stale no-op.
-fn armSendPoll(ctx: *LoopContext, index: usize) !void {
+fn armSendPoll(ctx: *const LoopContext, index: usize) !void {
     const pool = ctx.clients.pool.slice();
     try queuePollOut(ctx.ring, packCompletionKey(.{
         .kind = .poll,
@@ -728,8 +733,7 @@ fn releaseRecvBufferIfPresent(recv_buffers: *RecvBufferGroup, event: linux.io_ur
     recv_buffers.releaseBatch(batch);
 }
 
-fn startConnect(ctx: *LoopContext, index: usize, now_ms: u64) !void {
-    _ = now_ms;
+fn startConnect(ctx: *const LoopContext, index: usize) !void {
     const pool = ctx.clients.pool.slice();
 
     std.debug.assert(!pool.items(.flags)[index].socket_live);
@@ -748,11 +752,15 @@ fn startConnect(ctx: *LoopContext, index: usize, now_ms: u64) !void {
     }), @intCast(index), @intCast(addressFamily(&ctx.address)), socket_protocol);
 }
 
-fn finishConnect(ctx: *LoopContext, index: usize, now_ms: u64) !void {
+fn finishConnect(ctx: *const LoopContext, index: usize, now_ms: u64) !void {
     const pool = ctx.clients.pool.slice();
     if (!pool.items(.flags)[index].socket_live) return error.Disconnected;
     pool.items(.state)[index] = .connected;
-    pool.items(.backoff_ms)[index] = initial_backoff_ms;
+    // Backoff is intentionally NOT reset here: a bare TCP connect that is
+    // immediately dropped (server restarting, proxy closing the socket) would
+    // otherwise pin backoff at the floor and reconnect forever at ~250ms,
+    // pegging a core. It is reset in recordJoinProgress once the client has
+    // actually reached play.
     const phase = ctx.clients.getPhase(index);
     try client.onConnected(ctx.clients, index, phase, now_ms, ctx.packet_builder_buf, ctx.write_temp_buf);
     try armSend(ctx, index);
@@ -773,7 +781,7 @@ fn resetConnectionState(clients: *ClientTable, index: usize) bool {
     return preserve_inflight_send;
 }
 
-fn failClient(clients: *ClientTable, index: usize, err: anyerror, now_ms: u64, progress: ProgressSink, target: endpoint.Target) void {
+fn failClient(clients: *ClientTable, index: usize, err: anyerror, now_ms: u64, progress: ProgressSink, target: endpoint.Target, reconnect: bool) void {
     const pool = clients.pool.slice();
     const was_active = pool.items(.flags)[index].progress_active;
     const preserve_inflight_send = resetConnectionState(clients, index);
@@ -784,52 +792,64 @@ fn failClient(clients: *ClientTable, index: usize, err: anyerror, now_ms: u64, p
     if (!builtin.is_test and !progress.suppressesLogs()) {
         if (clients.io) |io| {
             if (reconnectWarnAllowed(clients, io, now_ms)) {
-                var username_buffer: [16]u8 = undefined;
-                const client_username = client.username(clients, index, &username_buffer) catch "<invalid>";
-                switch (target) {
-                    .tcp => printStderr(io, "warning: client {s}@{s}:{d} disconnected: {t}; reconnecting in {d}ms\n", .{
-                        client_username,
-                        clients.handshake_host,
-                        clients.handshake_port,
-                        err,
-                        delay,
-                    }),
-                    .unix => |unix| printStderr(io, "warning: client {s}@unix:{s} (handshake {s}:{d}) disconnected: {t}; reconnecting in {d}ms\n", .{
-                        client_username,
-                        unix.path,
-                        clients.handshake_host,
-                        clients.handshake_port,
-                        err,
-                        delay,
-                    }),
-                }
-                if (diagnostics_enabled) {
-                    const stats = clients.stats.slice();
-                    const last_packet_before = stats.items(.last_packet_id)[index];
-                    printStderr(io, "warning: client state before reconnect: phase={s} last_packet=0x{x}\n", .{
-                        @tagName(phase_before),
-                        last_packet_before,
-                    });
-                    printStderr(io, "warning: keep-alives answered={d}\n", .{
-                        stats.items(.keep_alives_answered)[index],
-                    });
-                } else {
-                    printStderr(io, "warning: client state before reconnect: phase={s}\n", .{@tagName(phase_before)});
-                }
+                warnDisconnect(clients, io, index, err, delay, phase_before, target, reconnect);
             }
         }
     }
 
     client.close(clients, index, phase, preserve_inflight_send);
-    pool.items(.next_attempt_ms)[index] = now_ms +| delay;
-    pool.items(.backoff_ms)[index] = @intCast(@min(delay *| 2, max_backoff_ms));
-    pool.items(.state)[index] = if (preserve_inflight_send or pool.items(.flags)[index].close_armed or pool.items(.flags)[index].socket_live) .draining else .waiting;
-    progress.scheduleReconnect(was_active);
+    const has_socket_work = preserve_inflight_send or pool.items(.flags)[index].close_armed or pool.items(.flags)[index].socket_live;
+    if (comptime features.reconnect) {
+        if (reconnect) {
+            pool.items(.next_attempt_ms)[index] = now_ms +| jitteredDelay(delay, clients.reconnect_prng.random());
+            pool.items(.backoff_ms)[index] = @intCast(@min(delay *| 2, max_backoff_ms));
+            pool.items(.state)[index] = if (has_socket_work) .draining else .waiting;
+            progress.scheduleReconnect(was_active);
+            return;
+        }
+    }
+    pool.items(.state)[index] = if (has_socket_work) .draining else .stopped;
+    progress.noteDrop(was_active);
+}
+
+// Cold path, deliberately `noinline`: it instantiates std.fmt for every message
+// below, and failClient's only caller (failRuntime) runs on every CQE handler.
+noinline fn warnDisconnect(
+    clients: *const ClientTable,
+    io: Io,
+    index: usize,
+    err: anyerror,
+    delay: u64,
+    phase_before: client.Phase,
+    target: endpoint.Target,
+    reconnect: bool,
+) void {
+    var username_buffer: [16]u8 = undefined;
+    const client_username = client.username(clients, index, &username_buffer) catch "<invalid>";
+    var action_buffer: [40]u8 = undefined;
+    const action: []const u8 = if (reconnect)
+        std.fmt.bufPrint(&action_buffer, "reconnecting in {d}ms", .{delay}) catch "reconnecting"
+    else
+        "not reconnecting";
+    switch (target) {
+        .tcp => printStderr(io, "warning: client {s}@{s}:{d} disconnected: {t}; {s}\n", .{ client_username, clients.handshake_host, clients.handshake_port, err, action }),
+        .unix => |unix| printStderr(io, "warning: client {s}@unix:{f} (handshake {s}:{d}) disconnected: {t}; {s}\n", .{ client_username, unix, clients.handshake_host, clients.handshake_port, err, action }),
+    }
+    if (comptime diagnostics_enabled) {
+        const stats = clients.stats.slice();
+        printStderr(io, "warning: client state at disconnect: phase={s} last_packet=0x{x}\n", .{ @tagName(phase_before), stats.items(.last_packet_id)[index] });
+        printStderr(io, "warning: keep-alives answered={d}\n", .{stats.items(.keep_alives_answered)[index]});
+    } else {
+        printStderr(io, "warning: client state at disconnect: phase={s}\n", .{@tagName(phase_before)});
+    }
 }
 
 fn recordJoinProgress(clients: *ClientTable, index: usize, progress: ProgressSink) void {
     const pool = clients.pool.slice();
     if (!client.joinedLogged(clients, index).*) return;
+    // Real progress reached: safe to reset backoff so a healthy client that
+    // later drops starts its next reconnect from the floor.
+    pool.items(.backoff_ms)[index] = initial_backoff_ms;
     const was_active = pool.items(.flags)[index].progress_active;
     const was_counted = pool.items(.flags)[index].progress_counted;
     if (was_active and was_counted) return;
@@ -838,11 +858,11 @@ fn recordJoinProgress(clients: *ClientTable, index: usize, progress: ProgressSin
     progress.enterPlay(!was_counted);
 }
 
-fn scheduleClient(ctx: *LoopContext, index: usize) void {
+fn scheduleClient(ctx: *const LoopContext, index: usize) void {
     const pool = ctx.clients.pool.slice();
     switch (pool.items(.state)[index]) {
         .waiting => ctx.scheduler.update(index, pool.items(.next_attempt_ms)[index]),
-        .connecting, .draining => ctx.scheduler.update(index, null),
+        .connecting, .draining, .stopped => ctx.scheduler.update(index, null),
         .connected => {
             const phase = ctx.clients.phases.items[index];
             ctx.scheduler.update(index, client.nextTimerMs(ctx.clients, index, phase));
@@ -854,12 +874,12 @@ fn canFinishDraining(state: PoolState) bool {
     return state.state == .draining and !state.flags.close_armed and !state.flags.send_armed and !state.flags.socket_live;
 }
 
-fn finishDraining(ctx: *LoopContext, index: usize) void {
+fn finishDraining(ctx: *const LoopContext, index: usize) void {
     const pool = ctx.clients.pool.slice();
     const state: PoolState = ctx.clients.pool.get(index);
     if (!canFinishDraining(state)) return;
     client.close(ctx.clients, index, ctx.clients.getPhase(index), false);
-    pool.items(.state)[index] = .waiting;
+    pool.items(.state)[index] = if (features.reconnect and ctx.reconnect) .waiting else .stopped;
     scheduleClient(ctx, index);
 }
 
@@ -880,12 +900,12 @@ fn failRuntime(ctx: *LoopContext, index: usize, err: anyerror, now_ms: u64, prog
             @intCast(index),
         );
     }
-    failClient(ctx.clients, index, err, now_ms, progress, ctx.target);
-    if (stats_enabled) ctx.aggregate.reconnects += 1;
+    failClient(ctx.clients, index, err, now_ms, progress, ctx.target, ctx.reconnect);
+    if (stats_enabled and ctx.reconnect) ctx.aggregate.reconnects += 1;
     scheduleClient(ctx, index);
 }
 
-fn noteKeepAliveQueued(ctx: *LoopContext, index: usize, pending_bytes: u16, now_ms: u64) void {
+fn noteKeepAliveQueued(ctx: *const LoopContext, index: usize, pending_bytes: u16, now_ms: u64) void {
     if (comptime !diagnostics_enabled) return;
     const stats = ctx.clients.stats.slice();
     stats.items(.keep_alive_started_ms)[index] = now_ms;
@@ -915,6 +935,16 @@ fn clearKeepAlivePending(clients: *ClientTable, index: usize) void {
     stats.items(.keep_alive_pending_bytes)[index] = 0;
 }
 
+// Equal-jitter backoff: keep at least half the delay, spread the rest randomly.
+// A synchronized mass disconnect otherwise reschedules every client for the
+// exact same instant, and they reconnect as one thundering herd every round.
+fn jitteredDelay(delay: u64, rng: std.Random) u64 {
+    if (comptime !features.reconnect) unreachable;
+    if (delay == 0) return 0;
+    const half = delay / 2;
+    return half + rng.uintLessThan(u64, delay - half + 1);
+}
+
 fn timeoutFromDue(due_optional: ?u64, now_ms: u64) i32 {
     const due = due_optional orelse return -1;
     if (due <= now_ms) return 0;
@@ -926,7 +956,7 @@ fn capTimeoutForStopCheck(timeout: i32) i32 {
     return @min(timeout, stop_check_interval_ms);
 }
 
-fn armSend(ctx: *LoopContext, index: usize) !void {
+fn armSend(ctx: *const LoopContext, index: usize) !void {
     const pool = ctx.clients.pool.slice();
     if (pool.items(.flags)[index].send_armed) return;
     if (pool.items(.state)[index] != .connected) return;
@@ -970,7 +1000,7 @@ fn armSend(ctx: *LoopContext, index: usize) !void {
     try queueSendMsgFixed(ctx.ring, key, @intCast(index), &ctx.send_msghdrs[index]);
 }
 
-fn armRecv(ctx: *LoopContext, index: usize) !void {
+fn armRecv(ctx: *const LoopContext, index: usize) !void {
     const pool = ctx.clients.pool.slice();
     if (pool.items(.flags)[index].recv_armed) return;
     if (pool.items(.state)[index] != .connected) return;
@@ -978,7 +1008,7 @@ fn armRecv(ctx: *LoopContext, index: usize) !void {
 
     pool.items(.recv_generation)[index] +%= 1;
     pool.items(.flags)[index].recv_armed = true;
-    try queueRecvMultishotFixed(ctx.ring, ctx.recv_buffers, packCompletionKey(.{
+    try queueRecvMultishotFixed(ctx.recv_buffers, packCompletionKey(.{
         .kind = .recv,
         .generation = pool.items(.recv_generation)[index],
         .index = index,
@@ -1014,14 +1044,20 @@ fn reconnectWarnAllowed(clients: *ClientTable, io: Io, now_ms: u64) bool {
 fn printStderr(io: Io, comptime fmt: []const u8, args: anytype) void {
     var buffer: [512]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
+    var truncated = false;
     writer.print(fmt, args) catch {
-        // Message exceeds the buffer: emit the truncated prefix rather than
-        // dropping it entirely.
-        Io.File.stderr().writeStreamingAll(io, writer.buffered()) catch {};
-        Io.File.stderr().writeStreamingAll(io, "...\n") catch {};
-        return;
+        truncated = true;
     };
-    Io.File.stderr().writeStreamingAll(io, writer.buffered()) catch {};
+    writeStderr(io, writer.buffered(), truncated);
+}
+
+// Out of line so every printStderr instantiation shares one copy of the write
+// instead of inlining the whole Io.Writer chain into each cold failure path.
+noinline fn writeStderr(io: Io, bytes: []const u8, truncated: bool) void {
+    const stderr = Io.File.stderr();
+    stderr.writeStreamingAll(io, bytes) catch {};
+    // The message did not fit the buffer: mark the prefix rather than drop it.
+    if (truncated) stderr.writeStreamingAll(io, "...\n") catch {};
 }
 
 fn monotonicMs(io: Io) u64 {
@@ -1038,6 +1074,12 @@ fn shouldStop() bool {
 
 fn handleSignal(_: posix.SIG) callconv(.c) void {
     stop_requested.store(true, .monotonic);
+    // A second signal means the graceful stop is not responding fast enough
+    // (e.g. a pathological reconnect storm); force an immediate exit so the
+    // user is never stuck. 128 + SIGINT(2) is the conventional exit code.
+    if (stop_signal_count.fetchAdd(1, .monotonic) >= 1) {
+        std.process.exit(130);
+    }
 }
 
 fn installSignalHandlers() void {
@@ -1050,6 +1092,22 @@ fn installSignalHandlers() void {
     posix.sigaction(.TERM, &action, null);
 }
 
+test "jitteredDelay stays within the equal-jitter window" {
+    if (comptime !features.reconnect) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0x9e3779b97f4a7c15);
+    const rng = prng.random();
+    try std.testing.expectEqual(@as(u64, 0), jitteredDelay(0, rng));
+    for (0..1000) |_| {
+        const d = jitteredDelay(1000, rng);
+        try std.testing.expect(d >= 500 and d <= 1000);
+    }
+    // Odd delay: half rounds down, upper bound is the full delay.
+    for (0..1000) |_| {
+        const d = jitteredDelay(251, rng);
+        try std.testing.expect(d >= 125 and d <= 251);
+    }
+}
+
 test "capTimeoutForStopCheck bounds indefinite and long io_uring waits" {
     try std.testing.expectEqual(@as(i32, stop_check_interval_ms), capTimeoutForStopCheck(-1));
     try std.testing.expectEqual(@as(i32, stop_check_interval_ms), capTimeoutForStopCheck(stop_check_interval_ms + 1));
@@ -1058,6 +1116,7 @@ test "capTimeoutForStopCheck bounds indefinite and long io_uring waits" {
 }
 
 test "failClient isolates one client and schedules reconnect backoff" {
+    if (comptime !features.reconnect) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var clients: ClientTable = .{};
     defer clients.deinit(allocator);
@@ -1077,11 +1136,14 @@ test "failClient isolates one client and schedules reconnect backoff" {
     clients.getPhase(0).* = .play;
     clients.getPhase(1).* = .play;
 
-    failClient(&clients, 0, error.Disconnected, 1_000, .none, .{ .tcp = .{ .host = "127.0.0.1" } });
+    failClient(&clients, 0, error.Disconnected, 1_000, .none, .{ .tcp = .{ .host = "127.0.0.1" } }, true);
 
     try std.testing.expectEqual(ConnectionState.waiting, pool.items(.state)[0]);
     try std.testing.expectEqual(ConnectionState.connected, pool.items(.state)[1]);
-    try std.testing.expectEqual(@as(u64, 1_250), pool.items(.next_attempt_ms)[0]);
+    // Reconnect is scheduled with equal-jitter backoff: at least half the
+    // 250ms delay, at most the full delay, relative to now (1_000).
+    try std.testing.expect(pool.items(.next_attempt_ms)[0] >= 1_000 + 125);
+    try std.testing.expect(pool.items(.next_attempt_ms)[0] <= 1_000 + 250);
     try std.testing.expectEqual(@as(u16, 500), pool.items(.backoff_ms)[0]);
     try std.testing.expectEqual(@as(u16, 8), pool.items(.connect_generation)[0]);
     try std.testing.expectEqual(@as(u16, 10), pool.items(.recv_generation)[0]);
@@ -1090,6 +1152,22 @@ test "failClient isolates one client and schedules reconnect backoff" {
     try std.testing.expect(!pool.items(.flags)[0].send_armed);
     try std.testing.expectEqual(client.Phase.disconnected, clients.phases.items[0]);
     try std.testing.expectEqual(client.Phase.play, clients.phases.items[1]);
+}
+
+test "failClient without reconnect drops the client instead of rescheduling" {
+    const allocator = std.testing.allocator;
+    var clients: ClientTable = .{};
+    defer clients.deinit(allocator);
+    try clients.ensureTotalCapacity(allocator, 1);
+    clients.appendAssumeCapacity(0, 0);
+
+    const pool = clients.pool.slice();
+    pool.items(.state)[0] = .connected;
+    clients.getPhase(0).* = .play;
+
+    failClient(&clients, 0, error.Disconnected, 1_000, .none, .{ .tcp = .{ .host = "127.0.0.1" } }, false);
+
+    try std.testing.expectEqual(ConnectionState.stopped, pool.items(.state)[0]);
 }
 
 test "failClient preserves an armed send until its completion" {
@@ -1106,7 +1184,7 @@ test "failClient preserves an armed send until its completion" {
     states.items(.flags)[0].send_armed = true;
     states.items(.send_generation)[0] = 41;
 
-    failClient(&clients, 0, error.Disconnected, 1000, .none, .{ .tcp = .{ .host = "127.0.0.1" } });
+    failClient(&clients, 0, error.Disconnected, 1000, .none, .{ .tcp = .{ .host = "127.0.0.1" } }, true);
 
     try std.testing.expectEqual(ConnectionState.draining, states.items(.state)[0]);
     try std.testing.expect(states.items(.flags)[0].socket_live);

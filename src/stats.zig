@@ -4,11 +4,17 @@ const build_options = @import("build_options");
 pub const stats_enabled = build_options.enable_stats;
 pub const diagnostics_enabled = build_options.enable_diagnostics;
 
+// `T` in diagnostics builds, `void` otherwise: the SoA column stays declared but
+// occupies no storage when diagnostics are compiled out.
+pub fn Column(comptime T: type) type {
+    return if (diagnostics_enabled) T else void;
+}
+
 pub const StatsColumns = struct {
-    last_packet_id: if (diagnostics_enabled) i32 else void = if (diagnostics_enabled) -1 else {},
-    keep_alives_answered: if (diagnostics_enabled) u32 else void = if (diagnostics_enabled) 0 else {},
-    keep_alive_started_ms: if (diagnostics_enabled) u64 else void = if (diagnostics_enabled) 0 else {},
-    keep_alive_pending_bytes: if (diagnostics_enabled) u16 else void = if (diagnostics_enabled) 0 else {},
+    last_packet_id: Column(i32) = if (diagnostics_enabled) -1 else {},
+    keep_alives_answered: Column(u32) = if (diagnostics_enabled) 0 else {},
+    keep_alive_started_ms: Column(u64) = if (diagnostics_enabled) 0 else {},
+    keep_alive_pending_bytes: Column(u16) = if (diagnostics_enabled) 0 else {},
 };
 
 pub const Disconnects = struct {
@@ -31,40 +37,35 @@ pub const Disconnects = struct {
     }
 
     pub fn record(self: *Disconnects, err: anyerror) void {
-        if (err == error.ServerDisconnected) {
-            self.server += 1;
-        } else if (err == error.Disconnected) {
-            self.transport += 1;
-        } else if (err == error.ConnectionRefused or
-            err == error.HostUnreachable or
-            err == error.NetworkUnreachable or
-            err == error.Timeout or
-            err == error.FileNotFound)
-        {
-            self.connect += 1;
-        } else if (err == error.ReadBufferLimitExceeded or
-            err == error.WriteBufferLimitExceeded)
-        {
-            self.buffer_limit += 1;
-        } else if (err == error.SystemResources or
-            err == error.OutOfMemory)
-        {
-            self.resource += 1;
-        } else if (err == error.OnlineModeUnsupported or
-            err == error.UnexpectedPacket or
-            err == error.MalformedPacket or
-            err == error.NegativeLength or
-            err == error.VarIntTooLong or
-            err == error.PacketTooLarge or
-            err == error.CompressionThresholdUnsupported or
-            err == error.StringTooLong or
-            err == error.EndOfStream or
-            err == error.UsernameTooLong)
-        {
-            self.protocol += 1;
-        } else {
-            self.other += 1;
-        }
+        const bucket = switch (err) {
+            error.ServerDisconnected => &self.server,
+            error.Disconnected => &self.transport,
+            error.ConnectionRefused,
+            error.HostUnreachable,
+            error.NetworkUnreachable,
+            error.Timeout,
+            error.FileNotFound,
+            => &self.connect,
+            error.ReadBufferLimitExceeded,
+            error.WriteBufferLimitExceeded,
+            => &self.buffer_limit,
+            error.SystemResources,
+            error.OutOfMemory,
+            => &self.resource,
+            error.OnlineModeUnsupported,
+            error.UnexpectedPacket,
+            error.MalformedPacket,
+            error.NegativeLength,
+            error.VarIntTooLong,
+            error.PacketTooLarge,
+            error.CompressionThresholdUnsupported,
+            error.StringTooLong,
+            error.EndOfStream,
+            error.UsernameTooLong,
+            => &self.protocol,
+            else => &self.other,
+        };
+        bucket.* += 1;
     }
 };
 

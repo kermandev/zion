@@ -24,23 +24,24 @@ pub fn main(init: std.process.Init) !void {
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, arena);
     _ = args.skip();
 
-    const action = cli.parse(&args) catch |err| {
-        try stderr.print("error: invalid arguments ({t})\n\n", .{err});
-        try report.writeUsage(stderr);
-        try stderr.flush();
-        std.process.exit(2);
-    };
-    const options = switch (action) {
-        .help => return report.writeUsage(stdout),
-        .version => return report.writeVersion(stdout),
-        .run => |run| run,
-    };
+    const action = cli.parse(&args) catch |err| try exitInvalidArgs(stderr, err);
+    switch (action) {
+        .help => try report.writeUsage(stdout),
+        .version => try report.writeVersion(stdout),
+        .run => |options| try runLoad(io, init.gpa, arena, stdout, stderr, options),
+    }
+}
 
-    const resolved_target = endpoint.resolveAndProbe(io, options.target) catch |err| {
-        try report.writeReachabilityError(stderr, options.target, err);
-        try stderr.flush();
-        std.process.exit(1);
-    };
+fn runLoad(
+    io: Io,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    options: cli.RunOptions,
+) !void {
+    const resolved_target = endpoint.resolveAndProbe(io, options.target) catch |err|
+        try exitUnreachable(stderr, options.target, err);
 
     const broadcast: if (features.broadcast) ?pool.Broadcast else void = if (comptime features.broadcast) if (options.broadcast) |broadcast_options| .{
         .interval_ms = broadcast_options.interval_ms,
@@ -64,18 +65,19 @@ pub fn main(init: std.process.Init) !void {
         .shard_count = shard_count,
         .known_core_pack = options.known_core_pack,
         .broadcast = if (comptime features.broadcast) if (broadcast) |value| .{ .interval_ms = value.interval_ms, .label = value.label } else null else {},
-        .client_tick = if (comptime features.client_tick) options.client_tick else {},
-        .progress_detail = if (comptime features.diagnostics) options.progress_detail else {},
-        .movement = if (comptime features.movement) options.movement else {},
+        .client_tick = options.client_tick,
+        .progress_detail = options.progress_detail,
+        .movement = options.movement,
     });
     try stdout.flush();
 
-    const stats = try pool.run(io, init.gpa, options.clients, resolved_target, .{
+    const stats = try pool.run(io, gpa, options.clients, resolved_target, .{
         .shards = options.shards,
-        .broadcast = if (comptime features.broadcast) broadcast else {},
-        .client_tick_packet = if (comptime features.client_tick) client_tick_packet else {},
-        .movement = if (comptime features.movement) options.movement else {},
+        .broadcast = broadcast,
+        .client_tick_packet = client_tick_packet,
+        .movement = options.movement,
         .connect_rate_per_sec = options.connect_rate_per_sec,
+        .reconnect = options.reconnect,
         .username_prefix = options.username_prefix,
         .known_core_pack = options.known_core_pack,
         .join_progress = &join_progress,
@@ -83,6 +85,21 @@ pub fn main(init: std.process.Init) !void {
     join_progress.end();
     try stdout.flush();
     try report.writeStatsBlocking(io, stats);
+}
+
+// Both exits flush stderr themselves: std.process.exit runs before main's
+// deferred flushes.
+fn exitInvalidArgs(stderr: *Io.Writer, err: anyerror) !noreturn {
+    try stderr.print("error: invalid arguments ({t})\n\n", .{err});
+    try report.writeUsage(stderr);
+    try stderr.flush();
+    std.process.exit(2);
+}
+
+fn exitUnreachable(stderr: *Io.Writer, target: endpoint.Target, err: anyerror) !noreturn {
+    try report.writeReachabilityError(stderr, target, err);
+    try stderr.flush();
+    std.process.exit(1);
 }
 
 test {
@@ -96,5 +113,7 @@ test {
     _ = @import("progress.zig");
     _ = @import("stats.zig");
     _ = @import("outbound.zig");
+    _ = @import("scheduler.zig");
+    _ = @import("pool.zig");
     _ = @import("bench.zig");
 }

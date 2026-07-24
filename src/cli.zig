@@ -13,6 +13,7 @@ pub const RunOptions = struct {
     clients: usize,
     shards: ?usize = null,
     connect_rate_per_sec: u32 = 100,
+    reconnect: bool = features.reconnect,
     username_prefix: []const u8 = "Zion",
     known_core_pack: bool = false,
     broadcast: if (features.broadcast) ?BroadcastOptions else void = if (features.broadcast) null else {},
@@ -34,6 +35,7 @@ const RawOptions = struct {
     clients: ?usize = null,
     shards: ?usize = null,
     connect_rate_per_sec: u32 = 100,
+    no_reconnect: bool = false,
     username_prefix: []const u8 = "Zion",
     known_core_pack: bool = false,
     broadcast_ms: if (features.broadcast) ?u64 else void = if (features.broadcast) null else {},
@@ -45,71 +47,106 @@ const RawOptions = struct {
     version: bool = false,
 };
 
+const Flag = enum {
+    @"--target",
+    @"--handshake-host",
+    @"--handshake-port",
+    @"--clients",
+    @"--shards",
+    @"--connect-rate",
+    @"--username-prefix",
+    @"--no-reconnect",
+    @"--known-core-pack",
+    @"--broadcast-ms",
+    @"--broadcast",
+    @"--client-tick",
+    @"--progress-detail",
+    @"--movement",
+    @"--movement-ms",
+    @"--movement-radius",
+    @"--movement-speed",
+    @"--rotation-rate",
+    @"--movement-seed",
+    @"--help",
+    @"-h",
+    @"--version",
+    @"-V",
+};
+
 pub fn parse(args: *std.process.Args.Iterator) !Action {
     var raw: RawOptions = .{};
     var unknown_flag = false;
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--target")) {
-            raw.target = parseTarget(try nextValue(args)) catch return error.InvalidArgs;
-        } else if (std.mem.eql(u8, arg, "--handshake-host")) {
-            raw.handshake_host = try nextValue(args);
-            if (raw.handshake_host.?.len == 0) return error.InvalidArgs;
-        } else if (std.mem.eql(u8, arg, "--handshake-port")) {
-            raw.handshake_port = parsePort(try nextValue(args)) catch return error.InvalidArgs;
-        } else if (std.mem.eql(u8, arg, "--clients")) {
-            raw.clients = try parseIntArg(usize, try nextValue(args));
-        } else if (std.mem.eql(u8, arg, "--shards")) {
-            raw.shards = try parseIntArg(usize, try nextValue(args));
-        } else if (std.mem.eql(u8, arg, "--connect-rate")) {
-            raw.connect_rate_per_sec = try parseIntArg(u32, try nextValue(args));
-        } else if (std.mem.eql(u8, arg, "--username-prefix")) {
-            raw.username_prefix = try nextValue(args);
-            if (raw.username_prefix.len == 0) return error.InvalidArgs;
-        } else if (std.mem.eql(u8, arg, "--known-core-pack")) {
-            raw.known_core_pack = true;
-        } else if (std.mem.eql(u8, arg, "--broadcast-ms")) {
-            if (comptime !features.broadcast) return error.FeatureDisabled;
-            raw.broadcast_ms = try parseIntArg(u64, try nextValue(args));
-            if (raw.broadcast_ms.? == 0) return error.InvalidArgs;
-        } else if (std.mem.eql(u8, arg, "--broadcast")) {
-            if (comptime !features.broadcast) return error.FeatureDisabled;
-            raw.broadcast_message = try nextValue(args);
-        } else if (std.mem.eql(u8, arg, "--client-tick")) {
-            if (comptime !features.client_tick) return error.FeatureDisabled;
-            raw.client_tick = true;
-        } else if (std.mem.eql(u8, arg, "--progress-detail")) {
-            if (comptime !features.diagnostics) return error.FeatureDisabled;
-            raw.progress_detail = true;
-        } else if (std.mem.eql(u8, arg, "--movement")) {
-            if (comptime !features.movement) return error.FeatureDisabled;
-            const value = try nextValue(args);
-            raw.movement.profile = std.meta.stringToEnum(client.MovementProfile, value) orelse return error.InvalidArgs;
-        } else if (std.mem.eql(u8, arg, "--movement-ms")) {
-            if (comptime !features.movement) return error.FeatureDisabled;
-            raw.movement.interval_ms = try parseIntArg(u64, try nextValue(args));
-            if (raw.movement.interval_ms == 0) return error.InvalidArgs;
-        } else if (std.mem.eql(u8, arg, "--movement-radius")) {
-            if (comptime !features.movement) return error.FeatureDisabled;
-            raw.movement.radius = try parseFloatArg(f64, try nextValue(args));
-            if (!(raw.movement.radius > 0) or !std.math.isFinite(raw.movement.radius)) return error.InvalidArgs;
-        } else if (std.mem.eql(u8, arg, "--movement-speed")) {
-            if (comptime !features.movement) return error.FeatureDisabled;
-            raw.movement.speed = try parseFloatArg(f64, try nextValue(args));
-            if (!(raw.movement.speed > 0) or !std.math.isFinite(raw.movement.speed)) return error.InvalidArgs;
-        } else if (std.mem.eql(u8, arg, "--rotation-rate")) {
-            if (comptime !features.movement) return error.FeatureDisabled;
-            raw.movement.rotation_rate = try parseFloatArg(f32, try nextValue(args));
-            if (!(raw.movement.rotation_rate > 0) or !std.math.isFinite(raw.movement.rotation_rate)) return error.InvalidArgs;
-        } else if (std.mem.eql(u8, arg, "--movement-seed")) {
-            if (comptime !features.movement) return error.FeatureDisabled;
-            raw.movement.seed = try parseIntArg(u64, try nextValue(args));
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            raw.help = true;
-        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
-            raw.version = true;
-        } else {
-            // Defer the error so --help/--version anywhere in argv still wins.
+        // Defer the unknown-flag error so --help/--version anywhere in argv still wins.
+        const flag = std.meta.stringToEnum(Flag, arg) orelse {
             unknown_flag = true;
+            continue;
+        };
+        switch (flag) {
+            .@"--target" => raw.target = parseTarget(try nextValue(args)) catch return error.InvalidArgs,
+            .@"--handshake-host" => {
+                const host = try nextValue(args);
+                if (host.len == 0) return error.InvalidArgs;
+                raw.handshake_host = host;
+            },
+            .@"--handshake-port" => raw.handshake_port = parsePort(try nextValue(args)) catch return error.InvalidArgs,
+            .@"--clients" => raw.clients = try parseIntArg(usize, try nextValue(args)),
+            .@"--shards" => raw.shards = try parseIntArg(usize, try nextValue(args)),
+            .@"--connect-rate" => raw.connect_rate_per_sec = try parseIntArg(u32, try nextValue(args)),
+            .@"--username-prefix" => {
+                raw.username_prefix = try nextValue(args);
+                if (raw.username_prefix.len == 0) return error.InvalidArgs;
+            },
+            .@"--no-reconnect" => {
+                if (comptime !features.reconnect) return error.FeatureDisabled;
+                raw.no_reconnect = true;
+            },
+            .@"--known-core-pack" => raw.known_core_pack = true,
+            .@"--broadcast-ms" => {
+                if (comptime !features.broadcast) return error.FeatureDisabled;
+                const interval_ms = try parseIntArg(u64, try nextValue(args));
+                if (interval_ms == 0) return error.InvalidArgs;
+                raw.broadcast_ms = interval_ms;
+            },
+            .@"--broadcast" => {
+                if (comptime !features.broadcast) return error.FeatureDisabled;
+                raw.broadcast_message = try nextValue(args);
+            },
+            .@"--client-tick" => {
+                if (comptime !features.client_tick) return error.FeatureDisabled;
+                raw.client_tick = true;
+            },
+            .@"--progress-detail" => {
+                if (comptime !features.diagnostics) return error.FeatureDisabled;
+                raw.progress_detail = true;
+            },
+            .@"--movement" => {
+                if (comptime !features.movement) return error.FeatureDisabled;
+                raw.movement.profile = std.meta.stringToEnum(client.MovementProfile, try nextValue(args)) orelse return error.InvalidArgs;
+            },
+            .@"--movement-ms" => {
+                if (comptime !features.movement) return error.FeatureDisabled;
+                raw.movement.interval_ms = try parseIntArg(u64, try nextValue(args));
+                if (raw.movement.interval_ms == 0) return error.InvalidArgs;
+            },
+            .@"--movement-radius" => {
+                if (comptime !features.movement) return error.FeatureDisabled;
+                raw.movement.radius = try parsePositiveFloat(f64, try nextValue(args));
+            },
+            .@"--movement-speed" => {
+                if (comptime !features.movement) return error.FeatureDisabled;
+                raw.movement.speed = try parsePositiveFloat(f64, try nextValue(args));
+            },
+            .@"--rotation-rate" => {
+                if (comptime !features.movement) return error.FeatureDisabled;
+                raw.movement.rotation_rate = try parsePositiveFloat(f32, try nextValue(args));
+            },
+            .@"--movement-seed" => {
+                if (comptime !features.movement) return error.FeatureDisabled;
+                raw.movement.seed = try parseIntArg(u64, try nextValue(args));
+            },
+            .@"--help", .@"-h" => raw.help = true,
+            .@"--version", .@"-V" => raw.version = true,
         }
     }
 
@@ -137,13 +174,15 @@ pub fn parse(args: *std.process.Args.Iterator) !Action {
     // Minecraft caps usernames at 16 characters. Usernames are the prefix
     // followed by a 1-based client number, so the prefix plus the digits of
     // the highest client number must fit.
-    if (raw.username_prefix.len + decimalDigits(clients) > 16) return error.InvalidArgs;
+    const client_digits: usize = std.math.log10_int(clients) + 1;
+    if (raw.username_prefix.len + client_digits > 16) return error.InvalidArgs;
 
     return .{ .run = .{
         .target = target,
         .clients = clients,
         .shards = raw.shards,
         .connect_rate_per_sec = raw.connect_rate_per_sec,
+        .reconnect = features.reconnect and !raw.no_reconnect,
         .username_prefix = raw.username_prefix,
         .known_core_pack = raw.known_core_pack,
         .broadcast = if (comptime features.broadcast) if (raw.broadcast_ms) |interval_ms| .{
@@ -218,13 +257,6 @@ test "parse validates username prefix length against the client count" {
     try std.testing.expectError(error.InvalidArgs, parse(&overflow_args));
 }
 
-fn decimalDigits(value: usize) usize {
-    var digits: usize = 1;
-    var remaining = value / 10;
-    while (remaining != 0) : (remaining /= 10) digits += 1;
-    return digits;
-}
-
 fn nextValue(args: *std.process.Args.Iterator) ![]const u8 {
     const value = args.next() orelse return error.InvalidArgs;
     if (std.mem.startsWith(u8, value, "--")) return error.InvalidArgs;
@@ -235,16 +267,29 @@ fn parseIntArg(comptime T: type, value: []const u8) !T {
     return std.fmt.parseInt(T, value, 10) catch error.InvalidArgs;
 }
 
-fn parseFloatArg(comptime T: type, value: []const u8) !T {
-    return std.fmt.parseFloat(T, value) catch error.InvalidArgs;
+// Always parses as f64 and narrows, so the binary carries one parseFloat
+// instantiation. The narrowing is exact: f64 keeps more than 2*24+2 bits, so
+// the second rounding cannot change the f32 result. The range check runs on the
+// narrowed value, so an f32 that overflowed to inf or flushed to zero is still
+// rejected. The negated comparison also rejects NaN.
+fn parsePositiveFloat(comptime T: type, value: []const u8) error{InvalidArgs}!T {
+    const parsed: T = @floatCast(std.fmt.parseFloat(f64, value) catch return error.InvalidArgs);
+    if (!(parsed > 0) or !std.math.isFinite(parsed)) return error.InvalidArgs;
+    return parsed;
 }
 
 pub fn parseTarget(value: []const u8) error{InvalidTarget}!endpoint.Target {
     if (value.len == 0) return error.InvalidTarget;
     if (std.mem.startsWith(u8, value, "unix:")) {
-        const path = value["unix:".len..];
-        if (path.len == 0) return error.InvalidTarget;
-        return .{ .unix = .{ .path = path } };
+        // A leading `@` selects the Linux abstract namespace, the spelling ss(8)
+        // and systemd use. The name lives outside the filesystem, so it is
+        // taken verbatim rather than resolved as a path.
+        const rest = value["unix:".len..];
+        const abstract = std.mem.startsWith(u8, rest, "@");
+        const name = if (abstract) rest[1..] else rest;
+        if (name.len == 0) return error.InvalidTarget;
+        if (name.len > endpoint.UnixAddress.maxNameLen(abstract)) return error.InvalidTarget;
+        return .{ .unix = .{ .path = name, .abstract = abstract } };
     }
 
     if (value[0] == '[') {
@@ -364,6 +409,21 @@ test "parse accepts optional feature tuning" {
     try std.testing.expectEqual(@as(u64, 99), options.movement.seed);
 }
 
+test "parse defaults reconnect on and --no-reconnect turns it off" {
+    if (comptime !features.reconnect) return error.SkipZigTest;
+    const default_argv = [_][*:0]const u8{ "zion", "--target", "127.0.0.1", "--clients", "10" };
+    var default_args = try std.process.Args.Iterator.initAllocator(.{ .vector = &default_argv }, std.testing.allocator);
+    defer default_args.deinit();
+    _ = default_args.skip();
+    try std.testing.expectEqual(features.reconnect, (try parse(&default_args)).run.reconnect);
+
+    const off_argv = [_][*:0]const u8{ "zion", "--target", "127.0.0.1", "--clients", "10", "--no-reconnect" };
+    var off_args = try std.process.Args.Iterator.initAllocator(.{ .vector = &off_argv }, std.testing.allocator);
+    defer off_args.deinit();
+    _ = off_args.skip();
+    try std.testing.expectEqual(false, (try parse(&off_args)).run.reconnect);
+}
+
 test "parse rejects incomplete broadcasts and infinite movement" {
     if (comptime !(features.broadcast and features.movement)) return error.SkipZigTest;
     const broadcast_argv = [_][*:0]const u8{ "zion", "--target", "127.0.0.1", "--clients", "10", "--broadcast", "hello" };
@@ -401,8 +461,42 @@ test "parseTarget accepts TCP IPv6 and Unix forms" {
 
     const unix = try parseTarget("unix:/run/minecraft.sock");
     try std.testing.expectEqualStrings("/run/minecraft.sock", unix.unix.path);
+    try std.testing.expect(!unix.unix.abstract);
     try std.testing.expectEqualStrings("localhost", unix.unix.handshake_host);
     try std.testing.expectEqual(@as(u16, 25565), unix.unix.handshake_port);
+}
+
+test "parseTarget reads @ as the abstract namespace" {
+    const abstract = try parseTarget("unix:@minecraft");
+    try std.testing.expect(abstract.unix.abstract);
+    // The marker is not part of the name the kernel sees.
+    try std.testing.expectEqualStrings("minecraft", abstract.unix.path);
+    try std.testing.expectEqualStrings("localhost", abstract.unix.handshake_host);
+
+    // A path merely containing @ stays a filesystem path.
+    const filesystem = try parseTarget("unix:/run/user@host.sock");
+    try std.testing.expect(!filesystem.unix.abstract);
+    try std.testing.expectEqualStrings("/run/user@host.sock", filesystem.unix.path);
+
+    // @ alone names nothing. The empty abstract name is a real Linux address
+    // (autobind), but a load tester has no use for one it cannot address.
+    try std.testing.expectError(error.InvalidTarget, parseTarget("unix:@"));
+
+    const prefix = "unix:@";
+    var too_long: [prefix.len + endpoint.UnixAddress.maxNameLen(true) + 1]u8 = @splat('a');
+    @memcpy(too_long[0..prefix.len], prefix);
+    try std.testing.expectError(error.InvalidTarget, parseTarget(&too_long));
+
+    // One byte shorter is the longest name the kernel can hold.
+    try std.testing.expect((try parseTarget(too_long[0 .. too_long.len - 1])).unix.abstract);
+}
+
+test "abstract targets render with their @ marker" {
+    var buffer: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    const target = try parseTarget("unix:@minecraft");
+    try writer.print("{f}", .{target.unix});
+    try std.testing.expectEqualStrings("@minecraft", writer.buffered());
 }
 
 test "parseTarget rejects malformed targets and port zero" {

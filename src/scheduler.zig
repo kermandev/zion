@@ -5,12 +5,10 @@ const none = std.math.maxInt(u32);
 const no_deadline = std.math.maxInt(u64);
 
 // Hierarchical occupancy bitmap over the 65,536 one-ms slots. A set bit marks a
-// slot whose intrusive chain is non-empty. The levels let us find the nearest
-// occupied slot (for the next deadline and for skipping idle gaps) in a bounded
-// number of steps that does not depend on the client count:
-//   level 0: `occupancy` — one bit per slot        (65_536 / 64 = 1024 words)
-//   level 1: `summary`    — one bit per level-0 word (1024 / 64 = 16 words)
-//   level 2: `top`        — one bit per summary word (16 bits in one word)
+// slot whose intrusive chain is non-empty: `occupancy` tracks slots, `summary`
+// tracks occupancy words, `top` tracks summary words. Nesting them this way
+// finds the nearest occupied slot (for the next deadline and for skipping idle
+// gaps) in a bounded number of steps that does not depend on the client count.
 //
 // Invariant relied on by the scans: every live deadline sits in the half-open
 // window [cursor_ms, cursor_ms + slot_count). `schedule` clamps to that window
@@ -154,7 +152,7 @@ pub const TimerWheel = struct {
 
     // Advances the cursor to the next occupied slot's ms, or to now_ms + 1 if no
     // occupied slot falls at-or-before now_ms (which also ends the takeDue loop).
-    fn nextCursor(self: *TimerWheel, now_ms: u64) u64 {
+    fn nextCursor(self: *const TimerWheel, now_ms: u64) u64 {
         const start = slotFor(self.cursor_ms);
         const target = self.firstOccupiedRing(start) orelse return now_ms + 1;
         // Ring distance from the (empty) cursor slot to the target slot; always
@@ -194,21 +192,26 @@ pub const TimerWheel = struct {
     }
 
     fn markOccupied(self: *TimerWheel, slot: usize) void {
-        const w = slot >> 6;
-        self.occupancy[w] |= @as(u64, 1) << @intCast(slot & 63);
-        const sw = w >> 6;
-        self.summary[sw] |= @as(u64, 1) << @intCast(w & 63);
-        self.top |= @as(u64, 1) << @intCast(sw);
+        const word = slot >> 6;
+        self.occupancy[word] |= bit(slot);
+        const summary_word = word >> 6;
+        self.summary[summary_word] |= bit(word);
+        self.top |= bit(summary_word);
     }
 
     fn markEmpty(self: *TimerWheel, slot: usize) void {
-        const w = slot >> 6;
-        self.occupancy[w] &= ~(@as(u64, 1) << @intCast(slot & 63));
-        if (self.occupancy[w] != 0) return;
-        const sw = w >> 6;
-        self.summary[sw] &= ~(@as(u64, 1) << @intCast(w & 63));
-        if (self.summary[sw] != 0) return;
-        self.top &= ~(@as(u64, 1) << @intCast(sw));
+        const word = slot >> 6;
+        self.occupancy[word] &= ~bit(slot);
+        if (self.occupancy[word] != 0) return;
+        const summary_word = word >> 6;
+        self.summary[summary_word] &= ~bit(word);
+        if (self.summary[summary_word] != 0) return;
+        self.top &= ~bit(summary_word);
+    }
+
+    // Single-bit mask for `index` within its own 64-bit word.
+    fn bit(index: usize) u64 {
+        return @as(u64, 1) << @intCast(index & 63);
     }
 
     // Nearest occupied slot at-or-after `start` in ring order (wrapping once),
@@ -223,32 +226,34 @@ pub const TimerWheel = struct {
     // occupancy/summary/top hierarchy. Null if none in [start, slot_count).
     fn scanFrom(self: *const TimerWheel, start: usize) ?usize {
         std.debug.assert(start < slot_count);
-        const w0 = start >> 6;
-        const bit_shift: u6 = @intCast(start & 63);
-        const word0 = (self.occupancy[w0] >> bit_shift) << bit_shift;
-        if (word0 != 0) return (w0 << 6) | @ctz(word0);
 
-        const w1 = w0 + 1;
-        if (w1 >= slot_words) return null;
+        const word = start >> 6;
+        const slot_bits = bitsFrom(self.occupancy[word], start);
+        if (slot_bits != 0) return (word << 6) | @ctz(slot_bits);
 
-        // Level 1: remaining occupied words in w1's summary word.
-        var sw = w1 >> 6;
-        const s_shift: u6 = @intCast(w1 & 63);
-        const summary_bits = (self.summary[sw] >> s_shift) << s_shift;
-        if (summary_bits != 0) {
-            const word_index = (sw << 6) | @ctz(summary_bits);
-            return (word_index << 6) | @ctz(self.occupancy[word_index]);
-        }
+        const next_word = word + 1;
+        if (next_word >= slot_words) return null;
+        const summary_word = next_word >> 6;
 
-        // Level 2: use the top word to jump to the next non-empty summary word.
-        sw += 1;
-        if (sw >= summary_words) return null;
-        const top_shift: u6 = @intCast(sw);
-        const top_bits = (self.top >> top_shift) << top_shift;
-        if (top_bits == 0) return null;
-        const summary_index = @ctz(top_bits);
-        const word_index = (summary_index << 6) | @ctz(self.summary[summary_index]);
-        return (word_index << 6) | @ctz(self.occupancy[word_index]);
+        const occupied_word = found: {
+            const word_bits = bitsFrom(self.summary[summary_word], next_word);
+            if (word_bits != 0) break :found (summary_word << 6) | @ctz(word_bits);
+
+            const next_summary_word = summary_word + 1;
+            if (next_summary_word >= summary_words) return null;
+            const summary_bits = bitsFrom(self.top, next_summary_word);
+            if (summary_bits == 0) return null;
+            // usize, not @ctz's u7: `<< 6` truncates in the operand type.
+            const occupied_summary: usize = @ctz(summary_bits);
+            break :found (occupied_summary << 6) | @ctz(self.summary[occupied_summary]);
+        };
+        return (occupied_word << 6) | @ctz(self.occupancy[occupied_word]);
+    }
+
+    // `word` with every bit below `index`'s position cleared.
+    fn bitsFrom(word: u64, index: usize) u64 {
+        const shift: u6 = @intCast(index & 63);
+        return (word >> shift) << shift;
     }
 };
 

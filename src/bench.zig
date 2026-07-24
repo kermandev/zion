@@ -19,6 +19,13 @@ const Benchmark = enum {
             .timer_walk => "timer-walk",
         };
     }
+
+    fn parse(value: []const u8) ?Benchmark {
+        inline for (comptime std.enums.values(Benchmark)) |benchmark| {
+            if (std.mem.eql(u8, value, benchmark.name())) return benchmark;
+        }
+        return null;
+    }
 };
 
 const Config = struct {
@@ -42,9 +49,13 @@ const Sample = struct {
     checksum: u64,
 
     fn actionsPerSecond(sample: Sample) f64 {
-        return @as(f64, @floatFromInt(sample.actions)) * std.time.ns_per_s / @as(f64, @floatFromInt(sample.elapsed_ns));
+        return ratePerSecond(sample.actions, sample.elapsed_ns);
     }
 };
+
+fn ratePerSecond(actions: usize, elapsed_ns: u64) f64 {
+    return @as(f64, @floatFromInt(actions)) * std.time.ns_per_s / @as(f64, @floatFromInt(elapsed_ns));
+}
 
 const Summary = struct {
     min_ns: u64,
@@ -107,17 +118,7 @@ fn parseArgs(args: *std.process.Args.Iterator) !Action {
     var config: Config = .{};
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--benchmark")) {
-            const value = try nextValue(args);
-            config.benchmark = if (std.mem.eql(u8, value, "scheduler"))
-                .scheduler
-            else if (std.mem.eql(u8, value, "timer-idle"))
-                .timer_idle
-            else if (std.mem.eql(u8, value, "timer-rotate"))
-                .timer_rotate
-            else if (std.mem.eql(u8, value, "timer-walk"))
-                .timer_walk
-            else
-                return error.InvalidArgs;
+            config.benchmark = Benchmark.parse(try nextValue(args)) orelse return error.InvalidArgs;
         } else if (std.mem.eql(u8, arg, "--clients")) {
             config.clients = try parseInt(usize, try nextValue(args));
         } else if (std.mem.eql(u8, arg, "--actions")) {
@@ -306,10 +307,6 @@ fn summarize(samples: []const Sample, scratch: []u64) Summary {
     };
 }
 
-fn medianRate(actions: usize, median_ns: u64) f64 {
-    return @as(f64, @floatFromInt(actions)) * std.time.ns_per_s / @as(f64, @floatFromInt(median_ns));
-}
-
 fn writeText(writer: *Io.Writer, config: Config, samples: []const Sample, summary: Summary) !void {
     try writer.print("{s} benchmark: zig={s} mode={s} clients={d} min_actions={d} interval_ms={d} warmups={d} samples={d}\n", .{
         config.benchmark.name(),
@@ -335,7 +332,7 @@ fn writeText(writer: *Io.Writer, config: Config, samples: []const Sample, summar
         summary.median_ns,
         summary.max_ns,
         summary.mean_ns,
-        medianRate(samples[0].actions, summary.median_ns),
+        ratePerSecond(samples[0].actions, summary.median_ns),
     });
 }
 
@@ -361,7 +358,7 @@ fn writeJson(writer: *Io.Writer, config: Config, samples: []const Sample, summar
         summary.median_ns,
         summary.max_ns,
         summary.mean_ns,
-        medianRate(samples[0].actions, summary.median_ns),
+        ratePerSecond(samples[0].actions, summary.median_ns),
     });
 }
 

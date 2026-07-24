@@ -33,6 +33,7 @@ pub fn writeUsage(writer: *Io.Writer) !void {
         \\  hostname or IPv4[:port]     minecraft.example.com or 127.0.0.1:25565
         \\  IPv6                       ::1 or [::1]:25565
         \\  Unix socket                unix:/run/minecraft.sock
+        \\  Abstract Unix socket       unix:@minecraft
         \\
         \\options:
         \\  --target <endpoint>         Server endpoint (required)
@@ -43,6 +44,10 @@ pub fn writeUsage(writer: *Io.Writer) !void {
         \\  --connect-rate <per-sec>    Connection rate per second; 0 disables the ramp and connects all clients at once. Default: 100
         \\  --username-prefix <prefix>  Prefix for client usernames. Default: "Zion"
         \\  --known-core-pack           Advertise minecraft:core for the compiled version
+        \\
+    );
+    if (comptime features.reconnect) try writer.writeAll(
+        \\  --no-reconnect              Do not reconnect dropped clients; they stay disconnected
         \\
     );
     // Feature order matches writeVersion: movement, broadcast, client-tick,
@@ -90,18 +95,22 @@ pub fn writeVersion(writer: *Io.Writer) !void {
     } else {
         try writer.print("protocol {d}", .{protocol_version});
     }
-    try writer.print("; Zig {s}; features:", .{builtin.zig_version_string});
-    if (comptime features.stats) try writer.writeAll(" stats");
-    if (comptime features.compression) try writer.writeAll(" compression");
-    if (comptime features.movement) try writer.writeAll(" movement");
-    if (comptime features.broadcast) try writer.writeAll(" broadcast");
-    if (comptime features.client_tick) try writer.writeAll(" client-tick");
-    if (comptime features.diagnostics) try writer.writeAll(" diagnostics");
-    if (comptime !features.stats and !features.compression and !features.movement and !features.broadcast and !features.client_tick and !features.diagnostics) {
-        try writer.writeAll(" none");
-    }
-    try writer.writeAll(")\n");
+    try writer.print("; Zig {s}; features:{s})\n", .{ builtin.zig_version_string, feature_list });
 }
+
+// Space prefixed list of the enabled features, or " none" when the build has
+// none. writeUsage documents the same set but leads with --no-reconnect.
+const feature_list = list: {
+    var list: []const u8 = "";
+    if (features.stats) list = list ++ " stats";
+    if (features.compression) list = list ++ " compression";
+    if (features.movement) list = list ++ " movement";
+    if (features.broadcast) list = list ++ " broadcast";
+    if (features.client_tick) list = list ++ " client-tick";
+    if (features.diagnostics) list = list ++ " diagnostics";
+    if (features.reconnect) list = list ++ " reconnect";
+    break :list if (list.len == 0) " none" else list;
+};
 
 pub fn writeRunHeader(writer: *Io.Writer, header: RunHeader) !void {
     try writer.writeAll("target: ");
@@ -127,22 +136,31 @@ pub fn writeRunHeader(writer: *Io.Writer, header: RunHeader) !void {
 
 pub fn writeTarget(writer: *Io.Writer, target: endpoint.Target) !void {
     switch (target) {
-        .tcp => |tcp| try writeHostPort(writer, tcp.host, tcp.port),
-        .unix => |unix| {
-            try writer.print("unix:{s} (handshake ", .{unix.path});
-            try writeHostPort(writer, unix.handshake_host, unix.handshake_port);
-            try writer.writeByte(')');
-        },
+        .tcp => |tcp| try writer.print("{f}", .{hostPort(tcp.host, tcp.port)}),
+        .unix => |unix| try writer.print("unix:{f} (handshake {f})", .{
+            unix,
+            hostPort(unix.handshake_host, unix.handshake_port),
+        }),
     }
 }
 
-fn writeHostPort(writer: *Io.Writer, host: []const u8, port: u16) !void {
-    if (std.mem.indexOfScalar(u8, host, ':') != null) {
-        try writer.print("[{s}]:{d}", .{ host, port });
-    } else {
-        try writer.print("{s}:{d}", .{ host, port });
-    }
+fn hostPort(host: []const u8, port: u16) HostPort {
+    return .{ .host = host, .port = port };
 }
+
+const HostPort = struct {
+    host: []const u8,
+    port: u16,
+
+    pub fn format(host_port: HostPort, writer: *Io.Writer) Io.Writer.Error!void {
+        // Bracket IPv6 literals so the ":port" suffix stays unambiguous.
+        if (std.mem.indexOfScalar(u8, host_port.host, ':') != null) {
+            try writer.print("[{s}]:{d}", .{ host_port.host, host_port.port });
+        } else {
+            try writer.print("{s}:{d}", .{ host_port.host, host_port.port });
+        }
+    }
+};
 
 pub fn writeStatsBlocking(io: Io, stats: client_table.Stats) !void {
     var buffer: [4096]u8 = undefined;
@@ -159,36 +177,46 @@ pub fn writeStats(writer: *Io.Writer, stats: client_table.Stats) !void {
     const play_percent = if (stats.requested == 0) 0.0 else @as(f64, @floatFromInt(stats.play)) * 100.0 / requested;
 
     try writer.writeAll("\nstats:\n");
-    try writer.print(
-        "  runtime: {d:.2}s\n" ++
-            "  clients: requested={d} connected={d} ({d:.1}%) play={d} ({d:.1}%) connecting={d} waiting={d}\n",
-        .{ seconds, stats.requested, stats.connected, connected_percent, stats.play, play_percent, stats.connecting, stats.waiting },
-    );
+    try writeLabel(writer, "runtime");
+    try writer.print("{d:.2}s\n", .{seconds});
+
+    try writeLabel(writer, "clients");
+    try writer.print("requested={d} connected={d} ({d:.1}%) play={d} ({d:.1}%)", .{ stats.requested, stats.connected, connected_percent, stats.play, play_percent });
+    // Transient states are usually zero at the end of a run; only show them
+    // when they carry information.
+    if (stats.connecting > 0) try writer.print(" connecting={d}", .{stats.connecting});
+    if (stats.waiting > 0) try writer.print(" waiting={d}", .{stats.waiting});
+    if (stats.stopped > 0) try writer.print(" stopped={d}", .{stats.stopped});
+    try writer.writeByte('\n');
 
     if (comptime stats_module.stats_enabled) {
         const packets_per_sec = @as(f64, @floatFromInt(stats.packets_received)) / rate_seconds;
         const reconnects_per_sec = @as(f64, @floatFromInt(stats.reconnects)) / rate_seconds;
         const rx_per_sec = @as(f64, @floatFromInt(stats.bytes_received)) / rate_seconds;
         const tx_per_sec = @as(f64, @floatFromInt(stats.bytes_sent)) / rate_seconds;
-        try writer.print(
-            "  reconnects: total={d} avg={d:.3}/s\n" ++
-                "  packets: received={d} keepalives={d} avg={d:.2}/s\n",
-            .{ stats.reconnects, reconnects_per_sec, stats.packets_received, stats.keep_alives_answered, packets_per_sec },
-        );
-        try writer.writeAll("  traffic: rx=");
-        try writeBytes(writer, @floatFromInt(stats.bytes_received), false);
-        try writer.writeAll(" tx=");
-        try writeBytes(writer, @floatFromInt(stats.bytes_sent), false);
-        try writer.writeAll(" total=");
-        try writeBytes(writer, @floatFromInt(stats.bytes_received +| stats.bytes_sent), false);
-        try writer.writeByte('\n');
-        try writer.writeAll("  rates: rx=");
-        try writeBytes(writer, rx_per_sec, true);
-        try writer.writeAll(" tx=");
-        try writeBytes(writer, tx_per_sec, true);
-        try writer.writeByte('\n');
+
+        try writeLabel(writer, "reconnects");
+        try writer.print("total={f} avg={d:.3}/s\n", .{ grouped(stats.reconnects), reconnects_per_sec });
+
+        try writeLabel(writer, "packets");
+        try writer.print("received={f} keepalives={f} avg={f}/s\n", .{
+            grouped(stats.packets_received),
+            grouped(stats.keep_alives_answered),
+            groupedFixed(packets_per_sec),
+        });
+
+        try writeLabel(writer, "traffic");
+        try writer.print("rx={f} tx={f} total={f}\n", .{
+            bytes(@floatFromInt(stats.bytes_received)),
+            bytes(@floatFromInt(stats.bytes_sent)),
+            bytes(@floatFromInt(stats.bytes_received +| stats.bytes_sent)),
+        });
+
+        try writeLabel(writer, "rates");
+        try writer.print("rx={f} tx={f}\n", .{ byteRate(rx_per_sec), byteRate(tx_per_sec) });
     } else {
-        try writer.writeAll("  counters: disabled at compile time (-Denable-stats=false)\n");
+        try writeLabel(writer, "counters");
+        try writer.writeAll("disabled at compile time (-Denable-stats=false)\n");
     }
 
     if (comptime stats_module.diagnostics_enabled) {
@@ -198,77 +226,146 @@ pub fn writeStats(writer: *Io.Writer, stats: client_table.Stats) !void {
         else
             @as(f64, @floatFromInt(diagnostics.keep_alive_send_total_ms)) /
                 @as(f64, @floatFromInt(diagnostics.keep_alive_send_samples));
-        try writer.print(
-            "  diagnostics: recv_nobufs={d} cq_overflow={d} close_failures={d} peak_cq={d}/{d} max_recv_bundle={d}B/{d} buffers\n" ++
-                "  keepalive-send: samples={d} avg={d:.3}ms max={d}ms\n" ++
-                "  disconnects: server={d} transport={d} connect={d} buffer={d} protocol={d} resource={d} other={d}\n",
-            .{
-                diagnostics.recv_nobufs,
-                diagnostics.cq_overflow,
-                diagnostics.close_failures,
-                diagnostics.max_cq_ready,
-                diagnostics.max_cq_entries,
-                diagnostics.max_recv_bundle_bytes,
-                diagnostics.max_recv_bundle_buffers,
-                diagnostics.keep_alive_send_samples,
-                keep_alive_avg_ms,
-                diagnostics.keep_alive_send_max_ms,
-                diagnostics.disconnects.server,
-                diagnostics.disconnects.transport,
-                diagnostics.disconnects.connect,
-                diagnostics.disconnects.buffer_limit,
-                diagnostics.disconnects.protocol,
-                diagnostics.disconnects.resource,
-                diagnostics.disconnects.other,
-            },
-        );
+
+        try writeLabel(writer, "diagnostics");
+        try writer.print("recv_nobufs={d} cq_overflow={d} close_failures={d} peak_cq={d}/{d} max_recv_bundle={f}/{d}\n", .{
+            diagnostics.recv_nobufs,
+            diagnostics.cq_overflow,
+            diagnostics.close_failures,
+            diagnostics.max_cq_ready,
+            diagnostics.max_cq_entries,
+            bytes(@floatFromInt(diagnostics.max_recv_bundle_bytes)),
+            diagnostics.max_recv_bundle_buffers,
+        });
+
+        try writeLabel(writer, "keepalive");
+        try writer.print("samples={d} avg={d:.3}ms max={d}ms\n", .{ diagnostics.keep_alive_send_samples, keep_alive_avg_ms, diagnostics.keep_alive_send_max_ms });
+
+        try writeLabel(writer, "disconnects");
+        try writeDisconnects(writer, diagnostics.disconnects);
+        try writer.writeByte('\n');
     }
 }
 
-fn writeBytes(writer: *Io.Writer, value: f64, per_second: bool) !void {
-    const units = [_][]const u8{ "B", "KiB", "MiB", "GiB", "TiB", "PiB" };
-    var scaled = value;
-    var unit_index: usize = 0;
-    while (scaled >= 1024.0 and unit_index + 1 < units.len) : (unit_index += 1) scaled /= 1024.0;
-    if (unit_index == 0) try writer.print("{d:.0} {s}", .{ scaled, units[unit_index] }) else try writer.print("{d:.2} {s}", .{ scaled, units[unit_index] });
-    if (per_second) try writer.writeAll("/s");
+// Left aligned label column so every value starts at the same offset.
+fn writeLabel(writer: *Io.Writer, name: []const u8) !void {
+    try writer.print("  {s:<11}  ", .{name});
 }
+
+fn writeDisconnects(writer: *Io.Writer, disconnects: stats_module.Disconnects) !void {
+    const Category = struct { name: []const u8, count: u64 };
+    var categories = [_]Category{
+        .{ .name = "connect", .count = disconnects.connect },
+        .{ .name = "transport", .count = disconnects.transport },
+        .{ .name = "server", .count = disconnects.server },
+        .{ .name = "protocol", .count = disconnects.protocol },
+        .{ .name = "resource", .count = disconnects.resource },
+        .{ .name = "buffer", .count = disconnects.buffer_limit },
+        .{ .name = "other", .count = disconnects.other },
+    };
+    // Show only the categories that fired, most frequent first, so the common
+    // failure modes lead and the all-zero noise is dropped. The sort is stable,
+    // so equal counts keep the order above.
+    std.sort.insertion(Category, &categories, {}, struct {
+        fn desc(_: void, a: Category, b: Category) bool {
+            return a.count > b.count;
+        }
+    }.desc);
+    var any = false;
+    for (categories) |category| {
+        if (category.count == 0) continue;
+        if (any) try writer.writeByte(' ');
+        try writer.print("{s}={f}", .{ category.name, grouped(category.count) });
+        any = true;
+    }
+    if (!any) try writer.writeAll("none");
+}
+
+fn grouped(value: u64) Grouped {
+    return .{ .value = value };
+}
+
+fn groupedFixed(value: f64) GroupedFixed {
+    return .{ .value = value };
+}
+
+// Thousands separated integer: 1234567 prints as 1,234,567.
+const Grouped = struct {
+    value: u64,
+
+    pub fn format(self: Grouped, writer: *Io.Writer) Io.Writer.Error!void {
+        var buffer: [20]u8 = undefined;
+        const digits = std.fmt.bufPrint(&buffer, "{d}", .{self.value}) catch unreachable;
+        try writeGroupedDigits(writer, digits);
+    }
+};
+
+// Thousands separated fixed-point number; only the integer part is grouped.
+const GroupedFixed = struct {
+    value: f64,
+
+    pub fn format(self: GroupedFixed, writer: *Io.Writer) Io.Writer.Error!void {
+        var buffer: [40]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "{d:.2}", .{self.value}) catch unreachable;
+        const point = std.mem.indexOfScalar(u8, text, '.') orelse text.len;
+        try writeGroupedDigits(writer, text[0..point]);
+        try writer.writeAll(text[point..]);
+    }
+};
+
+fn writeGroupedDigits(writer: *Io.Writer, digits: []const u8) !void {
+    for (digits, 0..) |digit, index| {
+        if (index != 0 and (digits.len - index) % 3 == 0) try writer.writeByte(',');
+        try writer.writeByte(digit);
+    }
+}
+
+fn bytes(value: f64) Bytes {
+    return .{ .value = value };
+}
+
+fn byteRate(value: f64) Bytes {
+    return .{ .value = value, .per_second = true };
+}
+
+const Bytes = struct {
+    value: f64,
+    per_second: bool = false,
+
+    pub fn format(self: Bytes, writer: *Io.Writer) Io.Writer.Error!void {
+        const units = [_][]const u8{ "B", "KiB", "MiB", "GiB", "TiB", "PiB" };
+        var scaled = self.value;
+        var unit: usize = 0;
+        while (scaled >= 1024.0 and unit + 1 < units.len) : (unit += 1) scaled /= 1024.0;
+        if (unit == 0) try writer.print("{d:.0} {s}", .{ scaled, units[unit] }) else try writer.print("{d:.2} {s}", .{ scaled, units[unit] });
+        if (self.per_second) try writer.writeAll("/s");
+    }
+};
 
 pub fn writeReachabilityError(writer: *Io.Writer, target: endpoint.Target, err: anyerror) !void {
     switch (target) {
         .unix => |unix| switch (err) {
-            error.FileNotFound => try writer.print("Unix socket {s} does not exist\n", .{unix.path}),
-            error.NotDir => try writer.print("a parent component of Unix socket {s} is not a directory\n", .{unix.path}),
-            error.AccessDenied, error.PermissionDenied => try writer.print("permission denied connecting to Unix socket {s}\n", .{unix.path}),
-            error.NameTooLong => try writer.print("Unix socket path is too long: {s}\n", .{unix.path}),
-            else => try writer.print("unable to connect to Unix socket {s}: {t}\n", .{ unix.path, err }),
+            // An abstract name that nobody bound is refused rather than
+            // missing: it never existed as a filesystem entry to look up.
+            error.ConnectionRefused => if (unix.abstract)
+                try writer.print("nothing is listening on abstract Unix socket {f}\n", .{unix})
+            else
+                try writer.print("Unix socket {f} exists but refused the connection; check that the server is still listening\n", .{unix}),
+            error.FileNotFound => try writer.print("Unix socket {f} does not exist\n", .{unix}),
+            error.NotDir => try writer.print("a parent component of Unix socket {f} is not a directory\n", .{unix}),
+            error.AccessDenied, error.PermissionDenied => try writer.print("permission denied connecting to Unix socket {f}\n", .{unix}),
+            error.NameTooLong => try writer.print("Unix socket name is too long: {f}\n", .{unix}),
+            else => try writer.print("unable to connect to Unix socket {f}: {t}\n", .{ unix, err }),
         },
-        .tcp => |tcp| switch (err) {
-            error.ConnectionRefused => {
-                try writer.writeAll("server ");
-                try writeHostPort(writer, tcp.host, tcp.port);
-                try writer.writeAll(" refused the connection; check that the Minecraft server is running and listening on that host/port\n");
-            },
-            error.HostUnreachable => {
-                try writer.writeAll("server host ");
-                try writeHostPort(writer, tcp.host, tcp.port);
-                try writer.writeAll(" is unreachable; check the address, route, firewall, or container networking\n");
-            },
-            error.NetworkUnreachable => {
-                try writer.writeAll("network is unreachable while connecting to ");
-                try writeHostPort(writer, tcp.host, tcp.port);
-                try writer.writeAll("; check local network configuration\n");
-            },
-            error.ConnectionTimedOut, error.Timeout => {
-                try writer.writeAll("timed out connecting to ");
-                try writeHostPort(writer, tcp.host, tcp.port);
-                try writer.writeAll("; check that the server is reachable and accepting status connections\n");
-            },
-            else => {
-                try writer.writeAll("unable to connect to ");
-                try writeHostPort(writer, tcp.host, tcp.port);
-                try writer.print(": {t}\n", .{err});
-            },
+        .tcp => |tcp| {
+            const server = hostPort(tcp.host, tcp.port);
+            switch (err) {
+                error.ConnectionRefused => try writer.print("server {f} refused the connection; check that the Minecraft server is running and listening on that host/port\n", .{server}),
+                error.HostUnreachable => try writer.print("server host {f} is unreachable; check the address, route, firewall, or container networking\n", .{server}),
+                error.NetworkUnreachable => try writer.print("network is unreachable while connecting to {f}; check local network configuration\n", .{server}),
+                error.ConnectionTimedOut, error.Timeout => try writer.print("timed out connecting to {f}; check that the server is reachable and accepting status connections\n", .{server}),
+                else => try writer.print("unable to connect to {f}: {t}\n", .{ server, err }),
+            }
         },
     }
 }
@@ -355,17 +452,19 @@ test "writeStats includes client packet and traffic rates" {
     }
     try writeStats(&writer, stats);
     const output = writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, output, "requested=100 connected=80 (80.0%) play=75 (75.0%)") != null);
+    // connecting/waiting are non-zero here, so both are shown; zeros are hidden.
+    try std.testing.expect(std.mem.indexOf(u8, output, "requested=100 connected=80 (80.0%) play=75 (75.0%) connecting=10 waiting=10") != null);
     if (comptime stats_module.stats_enabled) {
-        try std.testing.expect(std.mem.indexOf(u8, output, "reconnects: total=4 avg=2.000/s") != null);
-        try std.testing.expect(std.mem.indexOf(u8, output, "traffic: rx=2.00 KiB tx=1.00 KiB total=3.00 KiB") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "total=4 avg=2.000/s") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "rx=2.00 KiB tx=1.00 KiB total=3.00 KiB") != null);
     } else {
-        try std.testing.expect(std.mem.indexOf(u8, output, "counters: disabled at compile time") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "disabled at compile time") != null);
     }
     if (comptime stats_module.diagnostics_enabled) {
-        try std.testing.expect(std.mem.indexOf(u8, output, "recv_nobufs=3 cq_overflow=4 close_failures=5 peak_cq=128/512 max_recv_bundle=8192B/2 buffers") != null);
-        try std.testing.expect(std.mem.indexOf(u8, output, "keepalive-send: samples=2 avg=3.500ms max=5ms") != null);
-        try std.testing.expect(std.mem.indexOf(u8, output, "disconnects: server=1 transport=2 connect=0 buffer=0 protocol=0 resource=0 other=1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "recv_nobufs=3 cq_overflow=4 close_failures=5 peak_cq=128/512 max_recv_bundle=8.00 KiB/2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "samples=2 avg=3.500ms max=5ms") != null);
+        // Only fired categories, most frequent first; the zero ones are dropped.
+        try std.testing.expect(std.mem.indexOf(u8, output, "disconnects  transport=2 server=1 other=1") != null);
     }
 }
 

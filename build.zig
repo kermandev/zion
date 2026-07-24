@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
     const enable_broadcast = b.option(bool, "enable-broadcast", "Compile periodic chat broadcast support") orelse !minimal;
     const enable_client_tick = b.option(bool, "enable-client-tick", "Compile 50 ms client-tick traffic support") orelse !minimal;
     const enable_diagnostics = b.option(bool, "enable-diagnostics", "Compile detailed progress and per-client diagnostics") orelse !minimal;
+    const enable_reconnect = b.option(bool, "enable-reconnect", "Compile automatic client reconnect on disconnect") orelse !minimal;
     const requested_minecraft_version = b.option([]const u8, "minecraft-version", "Minecraft Java version to target, or latest") orelse "latest";
     const minecraft_version = if (std.mem.eql(u8, requested_minecraft_version, "latest")) minecraft_versions.latest.minecraft_version else requested_minecraft_version;
     const minecraft_release = findMinecraftRelease(minecraft_version) orelse @panic("unsupported -Dminecraft-version");
@@ -26,6 +27,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_broadcast", enable_broadcast);
     build_options.addOption(bool, "enable_client_tick", enable_client_tick);
     build_options.addOption(bool, "enable_diagnostics", enable_diagnostics);
+    build_options.addOption(bool, "enable_reconnect", enable_reconnect);
     build_options.addOption([]const u8, "minecraft_version", minecraft_version);
     build_options.addOption(i32, "minecraft_protocol_version", minecraft_release.protocol_version);
 
@@ -42,9 +44,7 @@ pub fn build(b: *std.Build) void {
             .strip = strip,
         }),
     });
-    exe.root_module.addOptions("build_options", build_options);
-    exe.root_module.addImport("minecraft_version", minecraft_version_module);
-    exe.root_module.link_libc = true;
+    addZionImports(exe.root_module, build_options, minecraft_version_module);
 
     exe.lto = if (optimize != .Debug) .full else .none;
 
@@ -64,9 +64,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = false,
     });
-    test_module.addOptions("build_options", build_options);
-    test_module.addImport("minecraft_version", minecraft_version_module);
-    test_module.link_libc = true;
+    addZionImports(test_module, build_options, minecraft_version_module);
 
     const exe_tests = b.addTest(.{
         .root_module = test_module,
@@ -94,15 +92,25 @@ pub fn build(b: *std.Build) void {
             .optimize = benchmark_optimize,
         }),
     });
-    bench_exe.root_module.addOptions("build_options", build_options);
-    bench_exe.root_module.addImport("minecraft_version", minecraft_version_module);
-    bench_exe.root_module.link_libc = true;
+    addZionImports(bench_exe.root_module, build_options, minecraft_version_module);
     bench_exe.lto = if (benchmark_optimize != .Debug) .full else .none;
     const bench_run = b.addRunArtifact(bench_exe);
     bench_run.stdio = .inherit;
     bench_run.addPassthruArgs();
     const bench_step = b.step("bench", "Run reproducible scheduler and timer benchmarks");
     bench_step.dependOn(&bench_run.step);
+}
+
+// Every zion module needs the same generated options, the selected version
+// implementation, and libc.
+fn addZionImports(
+    module: *std.Build.Module,
+    build_options: *std.Build.Step.Options,
+    minecraft_version_module: *std.Build.Module,
+) void {
+    module.addOptions("build_options", build_options);
+    module.addImport("minecraft_version", minecraft_version_module);
+    module.link_libc = true;
 }
 
 fn findMinecraftRelease(minecraft_version: []const u8) ?minecraft_versions.Release {

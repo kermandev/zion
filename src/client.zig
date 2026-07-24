@@ -93,6 +93,7 @@ pub const ConnectionState = enum(u8) {
     connecting,
     connected,
     draining,
+    stopped,
 };
 
 pub const initial_backoff_ms: u16 = 250;
@@ -193,7 +194,22 @@ pub const ReadResult = struct {
     last_packet_id: ?i32 = null,
     keep_alive_reply_bytes: if (diagnostics_enabled) ?u16 else void = if (diagnostics_enabled) null else {},
     effects: ReadEffects = .{},
+
+    /// Folds one decoded frame into the running totals for this receive.
+    pub fn record(result: *ReadResult, frame: FrameResult) void {
+        if (frame.packet_id) |id| result.last_packet_id = id;
+        if (frame.keep_alive) result.keep_alives += 1;
+        if (comptime diagnostics_enabled) {
+            if (frame.keep_alive_reply_bytes) |pending_bytes| result.keep_alive_reply_bytes = pending_bytes;
+        }
+        result.packets += 1;
+    }
 };
+
+/// Shard-local zlib scratch threaded through the read path. Both are void
+/// when compression is compiled out, so the read path stays fully typed.
+pub const DecompressBuf = if (protocol.compression_enabled) *std.ArrayList(u8) else void;
+pub const DecompressWindow = if (protocol.compression_enabled) []u8 else void;
 
 pub const ReadEffects = packed struct {
     write_ready: bool = false,
@@ -258,6 +274,9 @@ pub const ClientTable = struct {
     warn_window_start_ms: u64 = 0,
     warn_in_window: u32 = 0,
     warn_suppressed: u64 = 0,
+    // Per-shard PRNG used to jitter reconnect backoff so a mass disconnect does
+    // not put every client into lockstep. Re-seeded per shard in runShardLoop.
+    reconnect_prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
 
     pub fn deinit(clients: *ClientTable, allocator: std.mem.Allocator) void {
         const sessions = clients.sessions.slice();
@@ -375,24 +394,29 @@ pub fn username(clients: *const ClientTable, index: usize, buffer: *[16]u8) erro
 }
 pub fn onConnected(clients: *ClientTable, index: usize, phase: *Phase, now_ms: u64, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!void {
     phase.* = .disconnected;
-    releaseReadBuffer(clients, readState(clients, index));
-    readState(clients, index).discard_remaining = 0;
+    const read = readState(clients, index);
+    releaseReadBuffer(clients, read);
+    read.discard_remaining = 0;
     writeState(clients, index).clearRetainingCapacity();
     if (comptime protocol.compression_enabled) {
         compressionState(clients, index).* = .disabled;
     }
-    if (comptime features.broadcast) timerState(clients, index).next_broadcast_ms = no_deadline;
+
+    // Cache the SoA column pointer for this reset; nothing below appends to
+    // the session table, so the pointer stays valid.
+    const timers = timerState(clients, index);
+    const global_index = clients.global_indices.items[index];
+    timers.* = .{};
     if (comptime features.client_tick) {
-        timerState(clients, index).next_client_tick_ms = if (clients.client_tick_packet != null)
-            now_ms +| staggerOffsetMs(clients.global_indices.items[index], clients.total_client_count, client_tick_interval_ms)
-        else
-            no_deadline;
+        if (clients.client_tick_packet != null) {
+            timers.next_client_tick_ms = now_ms +| staggerOffsetMs(global_index, clients.total_client_count, client_tick_interval_ms);
+        }
     }
     if (comptime features.movement) {
         const interval = if (clients.movement.profile == .idle) movement_interval_ms else clients.movement.interval_ms;
-        timerState(clients, index).next_movement_ms = now_ms +| staggerOffsetMs(clients.global_indices.items[index], clients.total_client_count, interval);
+        timers.next_movement_ms = now_ms +| staggerOffsetMs(global_index, clients.total_client_count, interval);
         if (clients.movement.profile != .idle) {
-            motionState(clients, index).* = .{ .rng = mixSeed(clients.movement.seed, clients.global_indices.items[index]) };
+            motionState(clients, index).* = .{ .rng = mixSeed(clients.movement.seed, global_index) };
         }
     }
     if (comptime stats_module.diagnostics_enabled) {
@@ -408,7 +432,7 @@ pub fn onConnected(clients: *ClientTable, index: usize, phase: *Phase, now_ms: u
     {
         var packet = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.handshake.serverbound.intention);
         try protocol.version.writeHandshake(&packet.writer, clients.handshake_host, clients.handshake_port, .login);
-        try enqueueBuiltPacket(clients, index, &packet, .disabled, write_temp_buf);
+        try enqueueBuiltPacket(clients, index, packet.packetData(), write_temp_buf);
     }
     phase.* = .login;
     {
@@ -416,17 +440,17 @@ pub fn onConnected(clients: *ClientTable, index: usize, phase: *Phase, now_ms: u
         const client_username = try username(clients, index, &username_buffer);
         var packet = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.login.serverbound.login_start);
         try protocol.version.writeLoginStart(&packet.writer, client_username);
-        try enqueueBuiltPacket(clients, index, &packet, .disabled, write_temp_buf);
+        try enqueueBuiltPacket(clients, index, packet.packetData(), write_temp_buf);
     }
 
     if (comptime features.broadcast) {
         if (clients.broadcast_packet != null and clients.broadcast_interval_ms > 0) {
-            timerState(clients, index).next_broadcast_ms = now_ms +| staggerOffsetMs(clients.global_indices.items[index], clients.total_client_count, clients.broadcast_interval_ms);
+            timers.next_broadcast_ms = now_ms +| staggerOffsetMs(global_index, clients.total_client_count, clients.broadcast_interval_ms);
         }
     }
 }
 
-pub fn onReadBytes(clients: *ClientTable, index: usize, phase: *Phase, bytes: []const u8, decompress_buf: anytype, decompress_window: anytype, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!ReadResult {
+pub fn onReadBytes(clients: *ClientTable, index: usize, phase: *Phase, bytes: []const u8, decompress_buf: DecompressBuf, decompress_window: DecompressWindow, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!ReadResult {
     const before = readSnapshot(clients, index, phase.*);
     var result = try onReadBytesRaw(clients, index, phase, bytes, decompress_buf, decompress_window, packet_builder_buf, write_temp_buf);
     result.effects = readEffects(clients, index, phase.*, before);
@@ -437,7 +461,7 @@ pub fn onReadBytes(clients: *ClientTable, index: usize, phase: *Phase, bytes: []
 /// process many receive slices per completion take one `readSnapshot` before
 /// the batch and one `readEffects` after it instead of paying the state
 /// comparisons per slice.
-pub fn onReadBytesRaw(clients: *ClientTable, index: usize, phase: *Phase, bytes: []const u8, decompress_buf: anytype, decompress_window: anytype, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!ReadResult {
+pub fn onReadBytesRaw(clients: *ClientTable, index: usize, phase: *Phase, bytes: []const u8, decompress_buf: DecompressBuf, decompress_window: DecompressWindow, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!ReadResult {
     if (bytes.len == 0) return error.Disconnected;
 
     var result: ReadResult = .{ .bytes = bytes.len };
@@ -467,18 +491,12 @@ pub fn onReadBytesRaw(clients: *ClientTable, index: usize, phase: *Phase, bytes:
 
     var offset: usize = 0;
     while (try nextFrame(input[offset..])) |frame| {
-        const frame_res = try handleFrame(clients, index, phase, frame.bytes, decompress_buf, decompress_window, packet_builder_buf, write_temp_buf);
-        if (frame_res.packet_id) |id| result.last_packet_id = id;
-        if (frame_res.keep_alive) result.keep_alives += 1;
-        if (comptime diagnostics_enabled) {
-            if (frame_res.keep_alive_reply_bytes) |pending_bytes| result.keep_alive_reply_bytes = pending_bytes;
-        }
-        result.packets += 1;
+        result.record(try handleFrame(clients, index, phase, frame.bytes, decompress_buf, decompress_window, packet_builder_buf, write_temp_buf));
         offset += frame.consumed;
     }
 
     if (offset < input.len) {
-        if (try incompleteSkippedFrameRemaining(clients, index, phase, input[offset..], decompress_window)) |remaining| {
+        if (try incompleteSkippedFrameRemaining(clients, index, phase.*, input[offset..], decompress_window)) |remaining| {
             read.discard_remaining = @intCast(remaining);
             result.packets += 1;
         } else {
@@ -494,24 +512,24 @@ pub const ReadSnapshot = struct {
     joined: bool,
 };
 
-pub fn readSnapshot(clients: *ClientTable, index: usize, phase: Phase) ReadSnapshot {
+pub fn readSnapshot(clients: *const ClientTable, index: usize, phase: Phase) ReadSnapshot {
     return .{
         .write_bytes = queuedWriteBytes(clients, index),
         .deadline = nextTimerMs(clients, index, phase),
-        .joined = joinedLogged(clients, index).*,
+        .joined = clients.sessions.items(.joined_logged)[index],
     };
 }
 
-pub fn readEffects(clients: *ClientTable, index: usize, phase: Phase, before: ReadSnapshot) ReadEffects {
+pub fn readEffects(clients: *const ClientTable, index: usize, phase: Phase, before: ReadSnapshot) ReadEffects {
     return .{
         .write_ready = queuedWriteBytes(clients, index) != before.write_bytes,
         .deadline_changed = nextTimerMs(clients, index, phase) != before.deadline,
-        .progress_changed = joinedLogged(clients, index).* != before.joined,
+        .progress_changed = clients.sessions.items(.joined_logged)[index] != before.joined,
     };
 }
 
-fn queuedWriteBytes(clients: *ClientTable, index: usize) usize {
-    return writeState(clients, index).byteCount();
+fn queuedWriteBytes(clients: *const ClientTable, index: usize) usize {
+    return clients.sessions.items(.write)[index].byteCount();
 }
 
 pub fn onTimer(clients: *ClientTable, index: usize, phase: *Phase, now_ms: u64, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!bool {
@@ -558,12 +576,11 @@ pub fn onTimerFor(
         if (due != no_deadline) {
             if (now_ms >= due) {
                 const config = clients.movement;
-                const comp = compressionState(clients, index).*;
                 if (!backpressured) switch (movement_profile) {
                     .idle => {
                         var packet = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.play.serverbound.move_player_status_only);
                         try protocol.version.writeMovementStatusOnly(&packet.writer);
-                        try enqueueBuiltPacket(clients, index, &packet, comp, write_temp_buf);
+                        try enqueueBuiltPacket(clients, index, packet.packetData(), write_temp_buf);
                         wrote = true;
                     },
                     .rotate => if (motionState(clients, index).initialized) {
@@ -571,7 +588,7 @@ pub fn onTimerFor(
                         updateMotion(.rotate, motion, config, now_ms);
                         var packet = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.play.serverbound.move_player_rotation);
                         try protocol.version.writeMovementRotation(&packet.writer, motion.yaw, motion.pitch);
-                        try enqueueBuiltPacket(clients, index, &packet, comp, write_temp_buf);
+                        try enqueueBuiltPacket(clients, index, packet.packetData(), write_temp_buf);
                         wrote = true;
                     },
                     .walk => if (motionState(clients, index).initialized) {
@@ -579,7 +596,7 @@ pub fn onTimerFor(
                         updateMotion(.walk, motion, config, now_ms);
                         var packet = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.play.serverbound.move_player_position_rotation);
                         try protocol.version.writeMovementPositionRotation(&packet.writer, motion.x, motion.y, motion.z, motion.yaw, motion.pitch);
-                        try enqueueBuiltPacket(clients, index, &packet, comp, write_temp_buf);
+                        try enqueueBuiltPacket(clients, index, packet.packetData(), write_temp_buf);
                         wrote = true;
                     },
                 };
@@ -610,20 +627,21 @@ pub fn close(clients: *ClientTable, index: usize, phase: *Phase, preserve_inflig
     if (comptime protocol.compression_enabled) {
         compressionState(clients, index).* = .disabled;
     }
-    releaseReadBuffer(clients, readState(clients, index));
-    readState(clients, index).discard_remaining = 0;
+    const read = readState(clients, index);
+    releaseReadBuffer(clients, read);
+    read.discard_remaining = 0;
     writeState(clients, index).reset(clients.allocator, preserve_inflight_send);
-    if (comptime features.broadcast) timerState(clients, index).next_broadcast_ms = no_deadline;
-    if (comptime features.client_tick) timerState(clients, index).next_client_tick_ms = no_deadline;
+    // Every TimerState field defaults to no_deadline, so a fresh value is
+    // exactly "no timers armed".
+    timerState(clients, index).* = .{};
     if (comptime features.movement) {
-        timerState(clients, index).next_movement_ms = no_deadline;
         if (clients.movement.profile != .idle) motionState(clients, index).* = .{};
     }
     joinedLogged(clients, index).* = false;
 }
 
-pub fn wantsWrite(clients: *ClientTable, index: usize) bool {
-    return writeState(clients, index).segmentCount() != 0;
+pub fn wantsWrite(clients: *const ClientTable, index: usize) bool {
+    return clients.sessions.items(.write)[index].segmentCount() != 0;
 }
 
 pub fn beginWrite(clients: *ClientTable, index: usize) []const u8 {
@@ -632,7 +650,6 @@ pub fn beginWrite(clients: *ClientTable, index: usize) []const u8 {
 
 pub const GatheredWrite = struct {
     count: u8 = 0,
-    total_bytes: usize = 0,
 };
 
 /// Locks every queued outbound segment for one vectored send and resolves each
@@ -640,15 +657,13 @@ pub const GatheredWrite = struct {
 pub fn beginWriteGather(clients: *ClientTable, index: usize, slices: *[write_segment_capacity][]const u8) GatheredWrite {
     var pendings: [write_segment_capacity]outbound.Pending = undefined;
     const count = writeState(clients, index).beginAll(&pendings);
-    var total: usize = 0;
     for (pendings[0..count], slices[0..count]) |pending, *slice| {
         slice.* = resolvePendingWrite(clients, pending);
-        total += slice.len;
     }
-    return .{ .count = count, .total_bytes = total };
+    return .{ .count = count };
 }
 
-fn resolvePendingWrite(clients: *ClientTable, pending: outbound.Pending) []const u8 {
+fn resolvePendingWrite(clients: *const ClientTable, pending: outbound.Pending) []const u8 {
     return switch (pending) {
         .empty => &.{},
         .owned => |bytes| bytes,
@@ -660,7 +675,7 @@ fn resolvePendingWrite(clients: *ClientTable, pending: outbound.Pending) []const
     };
 }
 
-fn sharedFrame(clients: *ClientTable, source: outbound.SharedSource) []const u8 {
+fn sharedFrame(clients: *const ClientTable, source: outbound.SharedSource) []const u8 {
     return switch (source) {
         .broadcast_plain => if (comptime features.broadcast) clients.broadcast_packet.?.frame else unreachable,
         .broadcast_uncompressed => if (comptime features.broadcast and protocol.compression_enabled) clients.broadcast_packet.?.uncompressed_frame else unreachable,
@@ -680,20 +695,20 @@ pub fn onWriteComplete(clients: *ClientTable, index: usize, phase: *Phase, count
     writeState(clients, index).complete(count) catch return error.Disconnected;
 }
 
-pub fn nextTimerMs(clients: *ClientTable, index: usize, phase: Phase) ?u64 {
+pub fn nextTimerMs(clients: *const ClientTable, index: usize, phase: Phase) ?u64 {
     if (phase != .play) return null;
+    const timers = &clients.sessions.items(.timers)[index];
     var next: ?u64 = null;
-    if (comptime features.client_tick) next = minDeadline(next, timerState(clients, index).next_client_tick_ms);
-    if (comptime features.movement) next = minDeadline(next, timerState(clients, index).next_movement_ms);
-    if (comptime features.broadcast) next = minDeadline(next, timerState(clients, index).next_broadcast_ms);
+    if (comptime features.client_tick) next = minDeadline(next, timers.next_client_tick_ms);
+    if (comptime features.movement) next = minDeadline(next, timers.next_movement_ms);
+    if (comptime features.broadcast) next = minDeadline(next, timers.next_broadcast_ms);
     return next;
 }
 
-pub fn readBufferSlice(clients: *ClientTable, index: usize) []u8 {
-    if (readState(clients, index).buffer) |buffer| {
-        return buffer[0..readState(clients, index).len];
-    }
-    return &.{};
+pub fn readBufferSlice(clients: *const ClientTable, index: usize) []const u8 {
+    const read = &clients.sessions.items(.read)[index];
+    const buffer = read.buffer orelse return &.{};
+    return buffer[0..read.len];
 }
 
 pub fn appendReadBufferSlice(clients: *ClientTable, index: usize, bytes: []const u8) !void {
@@ -722,7 +737,7 @@ fn appendWriteBufferSlice(clients: *ClientTable, index: usize, bytes: []const u8
     };
 }
 
-fn drainPackets(clients: *ClientTable, index: usize, phase: *Phase, decompress_buf: anytype, decompress_window: anytype, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!ReadResult {
+fn drainPackets(clients: *ClientTable, index: usize, phase: *Phase, decompress_buf: DecompressBuf, decompress_window: DecompressWindow, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!ReadResult {
     // Cache the SoA column pointer for this per-packet loop; nothing below
     // appends to the session table, so the pointer stays valid.
     const read = readState(clients, index);
@@ -732,16 +747,10 @@ fn drainPackets(clients: *ClientTable, index: usize, phase: *Phase, decompress_b
         const offset = read.offset;
         if (offset >= slice.len) break;
         if (try nextFrame(slice[offset..])) |frame| {
-            const frame_res = try handleFrame(clients, index, phase, frame.bytes, decompress_buf, decompress_window, packet_builder_buf, write_temp_buf);
-            if (frame_res.packet_id) |id| result.last_packet_id = id;
-            if (frame_res.keep_alive) result.keep_alives += 1;
-            if (comptime diagnostics_enabled) {
-                if (frame_res.keep_alive_reply_bytes) |pending_bytes| result.keep_alive_reply_bytes = pending_bytes;
-            }
-            result.packets += 1;
+            result.record(try handleFrame(clients, index, phase, frame.bytes, decompress_buf, decompress_window, packet_builder_buf, write_temp_buf));
             read.offset += @intCast(frame.consumed);
         } else {
-            if (try incompleteSkippedFrameRemaining(clients, index, phase, slice[offset..], decompress_window)) |remaining| {
+            if (try incompleteSkippedFrameRemaining(clients, index, phase.*, slice[offset..], decompress_window)) |remaining| {
                 releaseReadBuffer(clients, read);
                 read.discard_remaining = @intCast(remaining);
                 result.packets += 1;
@@ -753,33 +762,32 @@ fn drainPackets(clients: *ClientTable, index: usize, phase: *Phase, decompress_b
     return result;
 }
 
-fn handleFrame(clients: *ClientTable, index: usize, phase: *Phase, frame: []const u8, decompress_buf: anytype, decompress_window: anytype, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!FrameResult {
-    const packet = (try decodeFrame(clients, index, phase, frame, decompress_buf, decompress_window)) orelse
-        return .{ .packet_id = null, .keep_alive = false };
+fn handleFrame(clients: *ClientTable, index: usize, phase: *Phase, frame: []const u8, decompress_buf: DecompressBuf, decompress_window: DecompressWindow, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!FrameResult {
+    const packet = (try decodeFrame(clients, index, phase.*, frame, decompress_buf, decompress_window)) orelse return .{};
 
     const keep_alive = try handlePacket(clients, index, phase, packet, packet_builder_buf, write_temp_buf);
-    return .{
-        .packet_id = packet.id,
-        .keep_alive = keep_alive,
-        .keep_alive_reply_bytes = if (comptime diagnostics_enabled)
-            if (keep_alive) @intCast(writeState(clients, index).byteCount()) else null
-        else {},
-    };
+    var result: FrameResult = .{ .packet_id = packet.id, .keep_alive = keep_alive };
+    if (comptime diagnostics_enabled) {
+        if (keep_alive) result.keep_alive_reply_bytes = @intCast(writeState(clients, index).byteCount());
+    }
+    return result;
 }
 
 /// Decodes a complete frame, parsing the length prefix and packet id exactly
 /// once. Returns null for unhandled play packets, which are skipped without
 /// fully decompressing compressed frames.
-fn decodeFrame(clients: *ClientTable, index: usize, phase: *Phase, frame: []const u8, decompress_buf: anytype, decompress_window: anytype) Error!?protocol.Packet {
-    if (phase.* == .play) {
+fn decodeFrame(clients: *ClientTable, index: usize, phase: Phase, frame: []const u8, decompress_buf: DecompressBuf, decompress_window: DecompressWindow) Error!?protocol.Packet {
+    if (phase == .play) {
         if (comptime protocol.compression_enabled) {
             if (compressionState(clients, index).* == .enabled) {
-                var frame_reader: Io.Reader = .fixed(frame);
-                var packet_reader = protocol.PacketReader.init(&frame_reader);
-                const data_len = try packet_reader.readVarInt();
+                // No decoded prefix with five bytes in hand can only be five
+                // continuation bytes; anything shorter is a truncated frame.
+                const header = peekVarInt(frame) orelse
+                    return if (frame.len < 5) error.EndOfStream else error.VarIntTooLong;
+                const data_len = header.value;
                 if (data_len < 0) return error.NegativeLength;
                 if (data_len > protocol.max_packet_len) return error.PacketTooLarge;
-                const body = frame[frame_reader.seek..];
+                const body = frame[header.consumed..];
                 if (data_len == 0) {
                     const packet = try protocol.packetFromPayload(body);
                     return if (isHandledPlayPacket(packet.id)) packet else null;
@@ -800,20 +808,21 @@ fn decodeFrame(clients: *ClientTable, index: usize, phase: *Phase, frame: []cons
 }
 
 fn compactReadBuffer(clients: *ClientTable, index: usize) void {
-    if (readState(clients, index).buffer == null) return;
-    if (readState(clients, index).offset == 0) return;
-    if (readState(clients, index).offset == readState(clients, index).len) {
-        releaseReadBuffer(clients, readState(clients, index));
+    const read = readState(clients, index);
+    const buffer = read.buffer orelse return;
+    if (read.offset == 0) return;
+    if (read.offset == read.len) {
+        releaseReadBuffer(clients, read);
         return;
     }
-    const slice = readState(clients, index).buffer.?;
-    std.mem.copyForwards(u8, slice[0 .. readState(clients, index).len - readState(clients, index).offset], slice[readState(clients, index).offset..readState(clients, index).len]);
-    readState(clients, index).len -= readState(clients, index).offset;
-    readState(clients, index).offset = 0;
+    const remaining = read.len - read.offset;
+    std.mem.copyForwards(u8, buffer[0..remaining], buffer[read.offset..read.len]);
+    read.len = remaining;
+    read.offset = 0;
 }
 
-fn incompleteSkippedFrameRemaining(clients: *ClientTable, index: usize, phase: *Phase, buffer: []const u8, decompress_window: anytype) Error!?usize {
-    if (phase.* != .play) return null;
+fn incompleteSkippedFrameRemaining(clients: *ClientTable, index: usize, phase: Phase, buffer: []const u8, decompress_window: DecompressWindow) Error!?usize {
+    if (phase != .play) return null;
 
     const outer = peekVarInt(buffer) orelse return null;
     // Reject oversized or negative declared lengths immediately instead of
@@ -858,18 +867,18 @@ fn handlePacket(clients: *ClientTable, index: usize, phase: *Phase, packet: prot
 
 fn replyKeepAlive(clients: *ClientTable, index: usize, payload: []const u8, packet_id: i32, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!void {
     var payload_reader: Io.Reader = .fixed(payload);
-    var packet_reader = protocol.PacketReader.init(&payload_reader);
+    const packet_reader = protocol.PacketReader.init(&payload_reader);
     var reply = try protocol.PacketFrame.init(packet_builder_buf, packet_id);
     try protocol.version.writeKeepAlive(&reply.writer, try packet_reader.readI64());
-    try enqueueBuiltPacket(clients, index, &reply, compressionState(clients, index).*, write_temp_buf);
+    try enqueueBuiltPacket(clients, index, reply.packetData(), write_temp_buf);
 }
 
 fn replyPong(clients: *ClientTable, index: usize, payload: []const u8, packet_id: i32, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!void {
     var payload_reader: Io.Reader = .fixed(payload);
-    var packet_reader = protocol.PacketReader.init(&payload_reader);
+    const packet_reader = protocol.PacketReader.init(&payload_reader);
     var reply = try protocol.PacketFrame.init(packet_builder_buf, packet_id);
     try protocol.version.writePong(&reply.writer, try packet_reader.readI32());
-    try enqueueBuiltPacket(clients, index, &reply, compressionState(clients, index).*, write_temp_buf);
+    try enqueueBuiltPacket(clients, index, reply.packetData(), write_temp_buf);
 }
 
 fn handleLoginPacket(clients: *ClientTable, index: usize, phase: *Phase, packet: protocol.Packet, packet_builder_buf: *Io.Writer.Allocating, write_temp_buf: *Io.Writer.Allocating) Error!void {
@@ -877,17 +886,17 @@ fn handleLoginPacket(clients: *ClientTable, index: usize, phase: *Phase, packet:
         packet_ids.login.clientbound.disconnect => return error.ServerDisconnected,
         packet_ids.login.clientbound.encryption_request => return error.OnlineModeUnsupported,
         packet_ids.login.clientbound.login_success => {
-            var acknowledge = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.login.serverbound.acknowledged);
-            try enqueueBuiltPacket(clients, index, &acknowledge, compressionState(clients, index).*, write_temp_buf);
+            const acknowledge = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.login.serverbound.acknowledged);
+            try enqueueBuiltPacket(clients, index, acknowledge.packetData(), write_temp_buf);
             phase.* = .configuration;
             var builder = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.configuration.serverbound.client_information);
             try protocol.version.writeClientInformation(&builder.writer);
-            try enqueueBuiltPacket(clients, index, &builder, compressionState(clients, index).*, write_temp_buf);
+            try enqueueBuiltPacket(clients, index, builder.packetData(), write_temp_buf);
         },
         packet_ids.login.clientbound.set_compression => {
             if (comptime !protocol.compression_enabled) return error.UnexpectedPacket;
             var payload_reader: Io.Reader = .fixed(packet.payload);
-            var packet_reader = protocol.PacketReader.init(&payload_reader);
+            const packet_reader = protocol.PacketReader.init(&payload_reader);
             // Vanilla semantics: a negative threshold disables compression.
             const threshold = try packet_reader.readVarInt();
             compressionState(clients, index).* = if (threshold < 0) .disabled else .{ .enabled = threshold };
@@ -901,8 +910,8 @@ fn handleConfigurationPacket(clients: *ClientTable, index: usize, phase: *Phase,
         packet_ids.configuration.clientbound.plugin_message => {},
         packet_ids.configuration.clientbound.disconnect => return error.ServerDisconnected,
         packet_ids.configuration.clientbound.finish => {
-            var builder = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.configuration.serverbound.finish);
-            try enqueueBuiltPacket(clients, index, &builder, compressionState(clients, index).*, write_temp_buf);
+            const builder = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.configuration.serverbound.finish);
+            try enqueueBuiltPacket(clients, index, builder.packetData(), write_temp_buf);
 
             phase.* = .play;
             joinedLogged(clients, index).* = true;
@@ -916,17 +925,17 @@ fn handleConfigurationPacket(clients: *ClientTable, index: usize, phase: *Phase,
         },
         packet_ids.configuration.clientbound.add_resource_pack => {
             var payload_reader: Io.Reader = .fixed(packet.payload);
-            var packet_reader = protocol.PacketReader.init(&payload_reader);
+            const packet_reader = protocol.PacketReader.init(&payload_reader);
             const uuid = try packet_reader.readUuid();
             var builder = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.configuration.serverbound.resource_pack_response);
             try protocol.version.writeResourcePackResponse(&builder.writer, uuid);
-            try enqueueBuiltPacket(clients, index, &builder, compressionState(clients, index).*, write_temp_buf);
+            try enqueueBuiltPacket(clients, index, builder.packetData(), write_temp_buf);
         },
         packet_ids.configuration.clientbound.known_packs => {
             var builder = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.configuration.serverbound.known_packs);
             const include_core = clients.known_core_pack and try offersCurrentCorePack(packet.payload);
             try protocol.version.writeKnownPacks(&builder.writer, include_core);
-            try enqueueBuiltPacket(clients, index, &builder, compressionState(clients, index).*, write_temp_buf);
+            try enqueueBuiltPacket(clients, index, builder.packetData(), write_temp_buf);
         },
         else => {},
     }
@@ -935,7 +944,7 @@ fn handleConfigurationPacket(clients: *ClientTable, index: usize, phase: *Phase,
 
 fn offersCurrentCorePack(payload: []const u8) protocol.PacketError!bool {
     var payload_reader: Io.Reader = .fixed(payload);
-    var reader = protocol.PacketReader.init(&payload_reader);
+    const reader = protocol.PacketReader.init(&payload_reader);
     const count = try reader.readVarInt();
     if (count < 0) return error.NegativeLength;
     var includes_core = false;
@@ -980,11 +989,7 @@ test "known core pack matching requires the selected Minecraft version" {
 
 test "configuration known-pack response advertises the selected core pack when enabled" {
     var phase: Phase = .configuration;
-    var test_session = try TestSession.init(std.testing.allocator, .{
-        .host = "127.0.0.1",
-        .username = "Zion0",
-        .known_core_pack = true,
-    });
+    var test_session = try TestSession.init(std.testing.allocator, .{ .known_core_pack = true });
     defer test_session.deinit();
 
     var offer_buffer: Io.Writer.Allocating = .init(std.testing.allocator);
@@ -995,7 +1000,7 @@ test "configuration known-pack response advertises the selected core pack when e
     try offer.writer.writeString("core", protocol.max_string_chars);
     try offer.writer.writeString(protocol.current.minecraft_version, protocol.max_string_chars);
     var offer_reader: Io.Reader = .fixed(offer.packetData());
-    var offer_packet_reader = protocol.PacketReader.init(&offer_reader);
+    const offer_packet_reader = protocol.PacketReader.init(&offer_reader);
     _ = try offer_packet_reader.readVarInt();
 
     _ = try handleConfigurationPacket(
@@ -1008,7 +1013,7 @@ test "configuration known-pack response advertises the selected core pack when e
     );
 
     var response_reader: Io.Reader = .fixed(test_session.writeBufferSlice());
-    var response = protocol.PacketReader.init(&response_reader);
+    const response = protocol.PacketReader.init(&response_reader);
     _ = try response.readVarInt();
     try std.testing.expectEqual(packet_ids.configuration.serverbound.known_packs, try response.readVarInt());
     try std.testing.expectEqual(@as(i32, 1), try response.readVarInt());
@@ -1023,7 +1028,7 @@ fn handlePlayPacket(clients: *ClientTable, index: usize, phase: *Phase, packet: 
         packet_ids.play.clientbound.chunk_batch_finished => {
             var builder = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.play.serverbound.chunk_batch_received);
             try protocol.version.writeChunkBatchReceived(&builder.writer);
-            try enqueueBuiltPacket(clients, index, &builder, compressionState(clients, index).*, write_temp_buf);
+            try enqueueBuiltPacket(clients, index, builder.packetData(), write_temp_buf);
         },
         packet_ids.play.clientbound.keep_alive => {
             try replyKeepAlive(clients, index, packet.payload, packet_ids.play.serverbound.keep_alive, packet_builder_buf, write_temp_buf);
@@ -1041,17 +1046,17 @@ fn handlePlayPacket(clients: *ClientTable, index: usize, phase: *Phase, packet: 
             }
             var builder = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.play.serverbound.accept_teleportation);
             try protocol.version.writeAcceptTeleportation(&builder.writer, teleport_id);
-            try enqueueBuiltPacket(clients, index, &builder, compressionState(clients, index).*, write_temp_buf);
+            try enqueueBuiltPacket(clients, index, builder.packetData(), write_temp_buf);
         },
         packet_ids.play.clientbound.login => {
-            var builder = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.play.serverbound.player_loaded);
-            try enqueueBuiltPacket(clients, index, &builder, compressionState(clients, index).*, write_temp_buf);
+            const builder = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.play.serverbound.player_loaded);
+            try enqueueBuiltPacket(clients, index, builder.packetData(), write_temp_buf);
 
             joinedLogged(clients, index).* = true;
         },
         packet_ids.play.clientbound.start_configuration => {
-            var builder = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.play.serverbound.configuration_acknowledged);
-            try enqueueBuiltPacket(clients, index, &builder, compressionState(clients, index).*, write_temp_buf);
+            const builder = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.play.serverbound.configuration_acknowledged);
+            try enqueueBuiltPacket(clients, index, builder.packetData(), write_temp_buf);
             phase.* = .configuration;
         },
         else => {},
@@ -1059,8 +1064,20 @@ fn handlePlayPacket(clients: *ClientTable, index: usize, phase: *Phase, packet: 
     return false;
 }
 
-fn enqueueBuiltPacket(clients: *ClientTable, index: usize, packet: *protocol.PacketFrame, comp: protocol.Compression, write_temp_buf: *Io.Writer.Allocating) Error!void {
-    try appendWritePacketFrame(clients, index, packet.packetData(), comp, write_temp_buf);
+/// Frames one freshly built packet with the client's current compression
+/// setting and appends it to the outbound queue.
+fn enqueueBuiltPacket(clients: *ClientTable, index: usize, packet_data: []const u8, write_temp_buf: *Io.Writer.Allocating) Error!void {
+    const comp = compressionState(clients, index).*;
+    write_temp_buf.clearRetainingCapacity();
+    if (comptime protocol.compression_enabled) {
+        if (comp == .enabled and clients.compress_window == null) {
+            clients.compress_window = try clients.allocator.alloc(u8, std.compress.flate.max_window_len);
+        }
+        try protocol.appendPacketFrame(clients.allocator, write_temp_buf, packet_data, comp, &clients.compress_buf, clients.compress_window);
+    } else {
+        try protocol.appendPacketFrame(clients.allocator, write_temp_buf, packet_data, comp, null, null);
+    }
+    try appendWriteBufferSlice(clients, index, write_temp_buf.written());
 }
 
 const CachedPacketKind = enum { broadcast, client_tick };
@@ -1097,19 +1114,6 @@ fn enqueueCachedPacket(clients: *ClientTable, index: usize, comptime kind: Cache
     writeState(clients, index).enqueueShared(source, frame.len) catch return error.WriteBufferLimitExceeded;
 }
 
-fn appendWritePacketFrame(clients: *ClientTable, index: usize, packet_data: []const u8, comp: protocol.Compression, write_temp_buf: *Io.Writer.Allocating) Error!void {
-    write_temp_buf.clearRetainingCapacity();
-    if (comptime protocol.compression_enabled) {
-        if (comp == .enabled and clients.compress_window == null) {
-            clients.compress_window = try clients.allocator.alloc(u8, std.compress.flate.max_window_len);
-        }
-        try protocol.appendPacketFrame(clients.allocator, write_temp_buf, packet_data, comp, &clients.compress_buf, clients.compress_window);
-    } else {
-        try protocol.appendPacketFrame(clients.allocator, write_temp_buf, packet_data, comp, null, null);
-    }
-    try appendWriteBufferSlice(clients, index, write_temp_buf.written());
-}
-
 pub const TestSession = struct {
     allocator: std.mem.Allocator,
     clients: ClientTable,
@@ -1119,9 +1123,9 @@ pub const TestSession = struct {
     write_temp_buf: Io.Writer.Allocating,
 
     pub const TestConfig = struct {
-        host: []const u8,
+        host: []const u8 = "127.0.0.1",
         port: u16 = 25565,
-        username: []const u8,
+        username: []const u8 = "Zion0",
         global_index: u32 = 0,
         movement: if (features.movement) MovementConfig else void = if (features.movement) .{} else {},
         known_core_pack: bool = false,
@@ -1131,9 +1135,7 @@ pub const TestSession = struct {
         const decompress_window = if (comptime protocol.compression_enabled)
             try allocator.alloc(u8, std.compress.flate.max_window_len)
         else {};
-        if (comptime protocol.compression_enabled) {
-            errdefer allocator.free(decompress_window);
-        }
+        errdefer if (comptime protocol.compression_enabled) allocator.free(decompress_window);
 
         var clients: ClientTable = .{
             .allocator = allocator,
@@ -1147,10 +1149,10 @@ pub const TestSession = struct {
         try clients.ensureTotalCapacity(allocator, 1);
         clients.appendAssumeCapacity(config.global_index, 0);
 
-        return TestSession{
+        return .{
             .allocator = allocator,
             .clients = clients,
-            .decompress_buf = if (comptime protocol.compression_enabled) std.ArrayList(u8).empty else {},
+            .decompress_buf = if (comptime protocol.compression_enabled) .empty else {},
             .decompress_window = decompress_window,
             .packet_builder_buf = .init(allocator),
             .write_temp_buf = .init(allocator),
@@ -1167,12 +1169,16 @@ pub const TestSession = struct {
         self.clients.deinit(self.allocator);
     }
 
+    pub fn decompressBuf(self: *TestSession) DecompressBuf {
+        return if (comptime protocol.compression_enabled) &self.decompress_buf else {};
+    }
+
     pub fn writeBufferSlice(self: *TestSession) []const u8 {
-        return resolvePendingWrite(&self.clients, self.clients.sessions.slice().items(.write)[0].peek());
+        return resolvePendingWrite(&self.clients, writeState(&self.clients, 0).peek());
     }
 
     pub fn clearWriteBuffer(self: *TestSession) void {
-        self.clients.sessions.slice().items(.write)[0].clearRetainingCapacity();
+        writeState(&self.clients, 0).clearRetainingCapacity();
     }
 };
 
@@ -1209,21 +1215,25 @@ test "staggerOffsetMs spreads clients across one interval" {
     try std.testing.expectEqual(@as(u64, 0), staggerOffsetMs(0, 100, 0));
 }
 
-fn mixSeed(seed: u64, index: u32) u64 {
-    if (comptime !features.movement) return 0;
-    var value = seed +% (@as(u64, @intCast(index)) *% 0x9e3779b97f4a7c15) +% 0x9e3779b97f4a7c15;
-    value = (value ^ (value >> 30)) *% 0xbf58476d1ce4e5b9;
+/// SplitMix64 increment (the odd 64 bit golden ratio).
+const seed_gamma: u64 = 0x9e3779b97f4a7c15;
+
+/// SplitMix64 finalizer: avalanches a counter into a well distributed u64.
+fn mix64(input: u64) u64 {
+    var value = (input ^ (input >> 30)) *% 0xbf58476d1ce4e5b9;
     value = (value ^ (value >> 27)) *% 0x94d049bb133111eb;
     return value ^ (value >> 31);
 }
 
+fn mixSeed(seed: u64, index: u32) u64 {
+    if (comptime !features.movement) return 0;
+    return mix64(seed +% (@as(u64, index) *% seed_gamma) +% seed_gamma);
+}
+
 fn randomUnit(state: *MotionState) f64 {
-    state.rng +%= 0x9e3779b97f4a7c15;
-    var value = state.rng;
-    value = (value ^ (value >> 30)) *% 0xbf58476d1ce4e5b9;
-    value = (value ^ (value >> 27)) *% 0x94d049bb133111eb;
-    value ^= value >> 31;
-    return @as(f64, @floatFromInt(value >> 11)) * (1.0 / 9007199254740992.0);
+    state.rng +%= seed_gamma;
+    // Top 53 bits scaled to [0, 1), the usual double precision unit draw.
+    return @as(f64, @floatFromInt(mix64(state.rng) >> 11)) * 0x1p-53;
 }
 
 fn wrapDegrees(angle: f32) f32 {
@@ -1253,9 +1263,15 @@ fn approachAngle(current: f32, target: f32, maximum: f32) f32 {
     return result;
 }
 
+/// A target still in force is replaced after 0.5 to 2.0 seconds; a walk target
+/// reached before then is replaced as soon as the client arrives.
+const decision_min_ms = 500;
+const decision_span_ms = 1500;
+
 fn chooseMotionTarget(comptime profile: MovementProfile, state: *MotionState, config: MovementConfig, now_ms: u64) void {
     if (comptime profile == .walk) {
-        const angle = randomUnit(state) * 2.0 * std.math.pi;
+        // Uniform point in the disc of `radius` around the spawn position.
+        const angle = randomUnit(state) * std.math.tau;
         const distance = @sqrt(randomUnit(state)) * config.radius;
         state.target_x = state.origin_x + @cos(angle) * distance;
         state.target_z = state.origin_z + @sin(angle) * distance;
@@ -1265,57 +1281,78 @@ fn chooseMotionTarget(comptime profile: MovementProfile, state: *MotionState, co
         _ = randomUnit(state);
         _ = randomUnit(state);
     }
+    // Drawn for every profile so the RNG stream does not depend on the profile.
     const random_yaw: f32 = @floatCast(randomUnit(state) * 360.0 - 180.0);
     state.target_yaw = if (comptime profile == .walk)
+        // Minecraft yaw is 0 towards +Z and grows clockwise, hence atan2(-dx, dz).
         @floatCast(std.math.atan2(state.x - state.target_x, state.target_z - state.z) * 180.0 / std.math.pi)
     else
         random_yaw;
     state.target_pitch = @floatCast(randomUnit(state) * 30.0 - 15.0);
-    state.next_decision_ms = now_ms + 500 + @as(u64, @intFromFloat(randomUnit(state) * 1500.0));
+    state.next_decision_ms = now_ms + decision_min_ms + @as(u64, @intFromFloat(randomUnit(state) * decision_span_ms));
     state.has_target = true;
 }
 
+/// Longest step a single update may simulate; a stalled shard resumes here.
+const max_step_ms = 250;
+/// Distance at which a walk target counts as reached.
+const arrival_distance = 0.05;
+
 fn updateMotion(comptime profile: MovementProfile, state: *MotionState, config: MovementConfig, now_ms: u64) void {
     if (!state.has_target or now_ms >= state.next_decision_ms) chooseMotionTarget(profile, state, config, now_ms);
-    const elapsed_ms = if (state.last_update_ms == 0) config.interval_ms else @min(now_ms -| state.last_update_ms, 250);
+    // last_update_ms == 0 right after a server teleport, so the first step
+    // after one is a nominal tick. A stalled shard is capped instead of
+    // teleporting the client across the world.
+    const elapsed_ms = if (state.last_update_ms == 0) config.interval_ms else @min(now_ms -| state.last_update_ms, max_step_ms);
     state.last_update_ms = now_ms;
-    const elapsed = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
+    const elapsed_s = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
 
     if (comptime profile == .walk) {
         const dx = state.target_x - state.x;
         const dz = state.target_z - state.z;
         const distance = @sqrt(dx * dx + dz * dz);
-        if (distance < 0.05) {
+        if (distance < arrival_distance) {
             state.has_target = false;
         } else {
-            const step = @min(config.speed * elapsed, distance);
+            const step = @min(config.speed * elapsed_s, distance);
             state.x += dx / distance * step;
             state.z += dz / distance * step;
         }
     }
 
-    const max_turn = config.rotation_rate * @as(f32, @floatCast(elapsed));
+    const max_turn = config.rotation_rate * @as(f32, @floatCast(elapsed_s));
     state.yaw = approachAngle(state.yaw, state.target_yaw, max_turn);
     state.pitch += std.math.clamp(state.target_pitch - state.pitch, -max_turn, max_turn);
     state.pitch = std.math.clamp(state.pitch, -90.0, 90.0);
 }
 
+/// Per-field "value is a delta, not an absolute" bits of the teleport packet.
+const PositionRelative = packed struct(i32) {
+    x: bool = false,
+    y: bool = false,
+    z: bool = false,
+    yaw: bool = false,
+    pitch: bool = false,
+    _unused: u27 = 0,
+};
+
 fn applyServerPosition(state: *MotionState, reader: *protocol.PacketReader) protocol.PacketError!void {
     const incoming_x = try reader.readF64();
     const incoming_y = try reader.readF64();
     const incoming_z = try reader.readF64();
+    // Delta movement x/y/z: the load tester has no velocity to update.
     _ = try reader.readF64();
     _ = try reader.readF64();
     _ = try reader.readF64();
     const incoming_yaw = try reader.readF32();
     const incoming_pitch = try reader.readF32();
-    const relative_flags = try reader.readI32();
+    const relative: PositionRelative = @bitCast(try reader.readI32());
 
-    state.x = if ((relative_flags & (1 << 0)) != 0) state.x + incoming_x else incoming_x;
-    state.y = if ((relative_flags & (1 << 1)) != 0) state.y + incoming_y else incoming_y;
-    state.z = if ((relative_flags & (1 << 2)) != 0) state.z + incoming_z else incoming_z;
-    state.yaw = wrapDegrees(if ((relative_flags & (1 << 3)) != 0) state.yaw + incoming_yaw else incoming_yaw);
-    state.pitch = std.math.clamp(if ((relative_flags & (1 << 4)) != 0) state.pitch + incoming_pitch else incoming_pitch, -90.0, 90.0);
+    state.x = if (relative.x) state.x + incoming_x else incoming_x;
+    state.y = if (relative.y) state.y + incoming_y else incoming_y;
+    state.z = if (relative.z) state.z + incoming_z else incoming_z;
+    state.yaw = wrapDegrees(if (relative.yaw) state.yaw + incoming_yaw else incoming_yaw);
+    state.pitch = std.math.clamp(if (relative.pitch) state.pitch + incoming_pitch else incoming_pitch, -90.0, 90.0);
     if (!state.initialized) {
         state.origin_x = state.x;
         state.origin_z = state.z;
@@ -1325,16 +1362,15 @@ fn applyServerPosition(state: *MotionState, reader: *protocol.PacketReader) prot
     state.last_update_ms = 0;
 }
 
+/// Decodes a VarInt without consuming it, off a plain slice rather than an
+/// `Io.Reader`. Unlike `PacketReader.readVarInt` a short buffer is not an
+/// error: null means "undecided, more bytes may arrive". Callers that have
+/// five bytes in hand treat null as `error.VarIntTooLong`.
 fn peekVarInt(buffer: []const u8) ?struct { value: i32, consumed: usize } {
     var value: u32 = 0;
-    var shift: u5 = 0;
     for (buffer[0..@min(buffer.len, 5)], 0..) |byte, i| {
-        value |= @as(u32, byte & 0x7f) << shift;
-        if ((byte & 0x80) == 0) {
-            return .{ .value = @bitCast(value), .consumed = i + 1 };
-        }
-        if (i == 4) break;
-        shift += 7;
+        value |= @as(u32, byte & 0x7f) << @intCast(i * 7);
+        if (byte & 0x80 == 0) return .{ .value = @bitCast(value), .consumed = i + 1 };
     }
     return null;
 }
@@ -1359,28 +1395,20 @@ const Frame = struct {
 };
 
 fn nextFrame(buffer: []const u8) Error!?Frame {
-    if (peekVarInt(buffer)) |res| {
-        if (res.value < 0) return error.NegativeLength;
-        if (res.value > protocol.max_packet_len) return error.PacketTooLarge;
-        const len: usize = @intCast(res.value);
-        const end = res.consumed + len;
-        if (buffer.len < end) return null;
-        return .{
-            .bytes = buffer[res.consumed..end],
-            .consumed = end,
-        };
-    }
-    if (buffer.len < 5) return null;
-    return error.VarIntTooLong;
+    // No length prefix yet: five bytes without a terminator is the only way
+    // that can happen once five bytes are buffered.
+    const prefix = peekVarInt(buffer) orelse
+        return if (buffer.len < 5) null else error.VarIntTooLong;
+    if (prefix.value < 0) return error.NegativeLength;
+    if (prefix.value > protocol.max_packet_len) return error.PacketTooLarge;
+    const end = prefix.consumed + @as(usize, @intCast(prefix.value));
+    if (buffer.len < end) return null;
+    return .{ .bytes = buffer[prefix.consumed..end], .consumed = end };
 }
 
 test "Session.onConnected queues login bytes without a socket read loop" {
     var phase: Phase = .disconnected;
-    var test_session = try TestSession.init(std.testing.allocator, .{
-        .host = "127.0.0.1",
-        .port = 25565,
-        .username = "Zion0",
-    });
+    var test_session = try TestSession.init(std.testing.allocator, .{});
     defer test_session.deinit();
 
     if (comptime stats_module.diagnostics_enabled) {
@@ -1432,7 +1460,7 @@ test "movement applies absolute and relative server positions" {
     try builder.writer.writeF64(0);
     try builder.writer.writeF32(15);
     try builder.writer.writeF32(-5);
-    try builder.writer.writeI32((1 << 0) | (1 << 2) | (1 << 3) | (1 << 4));
+    try builder.writer.writeI32(@bitCast(PositionRelative{ .x = true, .z = true, .yaw = true, .pitch = true }));
     payload_reader = .fixed(builder.packetData()[1..]);
     reader = protocol.PacketReader.init(&payload_reader);
     try applyServerPosition(&state, &reader);
@@ -1477,11 +1505,7 @@ test "bounded angle approach matches general degree wrapping" {
 test "Session.onReadBytes parses complete frames without retaining input" {
     const allocator = std.testing.allocator;
     var phase: Phase = .disconnected;
-    var test_session = try TestSession.init(allocator, .{
-        .host = "127.0.0.1",
-        .port = 25565,
-        .username = "Zion0",
-    });
+    var test_session = try TestSession.init(allocator, .{});
     defer test_session.deinit();
     try onConnected(&test_session.clients, 0, &phase, 100, &test_session.packet_builder_buf, &test_session.write_temp_buf);
     test_session.clearWriteBuffer();
@@ -1490,7 +1514,7 @@ test "Session.onReadBytes parses complete frames without retaining input" {
     const frame = try packet.finish(.disabled);
     defer allocator.free(frame);
 
-    _ = try onReadBytes(&test_session.clients, 0, &phase, frame, &test_session.decompress_buf, test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
+    _ = try onReadBytes(&test_session.clients, 0, &phase, frame, test_session.decompressBuf(), test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
 
     try std.testing.expectEqual(Phase.configuration, phase);
     try std.testing.expectEqual(@as(usize, 0), readBufferSlice(&test_session.clients, 0).len);
@@ -1499,11 +1523,7 @@ test "Session.onReadBytes parses complete frames without retaining input" {
 test "Session.onReadBytes retains only fragmented tails" {
     const allocator = std.testing.allocator;
     var phase: Phase = .disconnected;
-    var test_session = try TestSession.init(allocator, .{
-        .host = "127.0.0.1",
-        .port = 25565,
-        .username = "Zion0",
-    });
+    var test_session = try TestSession.init(allocator, .{});
     defer test_session.deinit();
     try onConnected(&test_session.clients, 0, &phase, 100, &test_session.packet_builder_buf, &test_session.write_temp_buf);
     test_session.clearWriteBuffer();
@@ -1512,13 +1532,13 @@ test "Session.onReadBytes retains only fragmented tails" {
     const frame = try packet.finish(.disabled);
     defer allocator.free(frame);
 
-    _ = try onReadBytes(&test_session.clients, 0, &phase, frame[0..1], &test_session.decompress_buf, test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
+    _ = try onReadBytes(&test_session.clients, 0, &phase, frame[0..1], test_session.decompressBuf(), test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
     try std.testing.expectEqual(@as(usize, 1), readBufferSlice(&test_session.clients, 0).len);
     try std.testing.expectEqual(@as(u32, initial_read_buffer_size), readState(&test_session.clients, 0).capacity);
     try std.testing.expectEqual(@as(usize, initial_read_buffer_size), test_session.clients.read_buffer_bytes);
     try std.testing.expectEqual(Phase.login, phase);
 
-    _ = try onReadBytes(&test_session.clients, 0, &phase, frame[1..], &test_session.decompress_buf, test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
+    _ = try onReadBytes(&test_session.clients, 0, &phase, frame[1..], test_session.decompressBuf(), test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
 
     try std.testing.expectEqual(Phase.configuration, phase);
     try std.testing.expectEqual(@as(usize, 0), readBufferSlice(&test_session.clients, 0).len);
@@ -1526,11 +1546,7 @@ test "Session.onReadBytes retains only fragmented tails" {
 }
 
 test "fragment buffering obeys the shard memory budget" {
-    var test_session = try TestSession.init(std.testing.allocator, .{
-        .host = "127.0.0.1",
-        .port = 25565,
-        .username = "Zion0",
-    });
+    var test_session = try TestSession.init(std.testing.allocator, .{});
     defer test_session.deinit();
     test_session.clients.read_buffer_limit = initial_read_buffer_size;
 
@@ -1542,17 +1558,13 @@ test "fragment buffering obeys the shard memory budget" {
 
 test "fragmented ignored play packets are discarded without allocation" {
     var phase: Phase = .play;
-    var test_session = try TestSession.init(std.testing.allocator, .{
-        .host = "127.0.0.1",
-        .port = 25565,
-        .username = "Zion0",
-    });
+    var test_session = try TestSession.init(std.testing.allocator, .{});
     defer test_session.deinit();
 
     // A 1 MiB uncompressed play packet with an unhandled packet id. Only its
     // prefix is present; the remainder should be counted down across receives.
     const prefix = [_]u8{ 0x80, 0x80, 0x40, 0x01 };
-    const result = try onReadBytes(&test_session.clients, 0, &phase, &prefix, &test_session.decompress_buf, test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
+    const result = try onReadBytes(&test_session.clients, 0, &phase, &prefix, test_session.decompressBuf(), test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
     try std.testing.expectEqual(@as(usize, prefix.len), result.bytes);
     try std.testing.expectEqual(@as(usize, 1), result.packets);
     try std.testing.expect(!result.effects.write_ready);
@@ -1562,7 +1574,7 @@ test "fragmented ignored play packets are discarded without allocation" {
     try std.testing.expectEqual(@as(u32, 1024 * 1024 - 1), readState(&test_session.clients, 0).discard_remaining);
 
     const payload: [16]u8 = @splat(0);
-    _ = try onReadBytes(&test_session.clients, 0, &phase, &payload, &test_session.decompress_buf, test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
+    _ = try onReadBytes(&test_session.clients, 0, &phase, &payload, test_session.decompressBuf(), test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
     try std.testing.expectEqual(@as(u32, 1024 * 1024 - 17), readState(&test_session.clients, 0).discard_remaining);
     try std.testing.expectEqual(@as(usize, 0), test_session.clients.read_buffer_bytes);
 }
@@ -1571,11 +1583,7 @@ test "fragmented compressed play packets are discarded without allocation" {
     if (comptime !protocol.compression_enabled) return error.SkipZigTest;
 
     var phase: Phase = .play;
-    var test_session = try TestSession.init(std.testing.allocator, .{
-        .host = "127.0.0.1",
-        .port = 25565,
-        .username = "Zion0",
-    });
+    var test_session = try TestSession.init(std.testing.allocator, .{});
     defer test_session.deinit();
     compressionState(&test_session.clients, 0).* = .{ .enabled = 0 };
 
@@ -1591,7 +1599,7 @@ test "fragmented compressed play packets are discarded without allocation" {
     defer std.testing.allocator.free(frame);
     const split = frame.len / 2;
 
-    _ = try onReadBytes(&test_session.clients, 0, &phase, frame[0..split], &test_session.decompress_buf, test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
+    _ = try onReadBytes(&test_session.clients, 0, &phase, frame[0..split], test_session.decompressBuf(), test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
     try std.testing.expectEqual(@as(?[*]u8, null), readState(&test_session.clients, 0).buffer);
     try std.testing.expectEqual(@as(u32, @intCast(frame.len - split)), readState(&test_session.clients, 0).discard_remaining);
     try std.testing.expectEqual(@as(usize, 0), test_session.clients.read_buffer_bytes);
@@ -1601,11 +1609,7 @@ test "compressed play keep alive is decoded and queued" {
     if (comptime !protocol.compression_enabled) return error.SkipZigTest;
 
     var phase: Phase = .disconnected;
-    var test_session = try TestSession.init(std.testing.allocator, .{
-        .host = "127.0.0.1",
-        .port = 25565,
-        .username = "Zion0",
-    });
+    var test_session = try TestSession.init(std.testing.allocator, .{});
     defer test_session.deinit();
     try onConnected(&test_session.clients, 0, &phase, 100, &test_session.packet_builder_buf, &test_session.write_temp_buf);
     test_session.clearWriteBuffer();
@@ -1617,7 +1621,7 @@ test "compressed play keep alive is decoded and queued" {
     const frame = try packet.finish(.{ .enabled = 0 });
     defer std.testing.allocator.free(frame);
 
-    const result = try onReadBytes(&test_session.clients, 0, &phase, frame, &test_session.decompress_buf, test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
+    const result = try onReadBytes(&test_session.clients, 0, &phase, frame, test_session.decompressBuf(), test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
     try std.testing.expectEqual(@as(usize, 1), result.keep_alives);
     try std.testing.expect(result.effects.write_ready);
     try std.testing.expect(!result.effects.deadline_changed);
@@ -1629,11 +1633,7 @@ test "compressed play keep alive is decoded and queued" {
 }
 
 test "outbound buffering has one aggregate per-client limit" {
-    var test_session = try TestSession.init(std.testing.allocator, .{
-        .host = "127.0.0.1",
-        .port = 25565,
-        .username = "Zion0",
-    });
+    var test_session = try TestSession.init(std.testing.allocator, .{});
     defer test_session.deinit();
 
     const bytes = try std.testing.allocator.alloc(u8, max_queued_write_bytes + 1);
@@ -1656,7 +1656,7 @@ test "cached packets retain an immutable fully compressed frame" {
     defer std.testing.allocator.free(window);
 
     var frame_reader: Io.Reader = .fixed(cached.compressed_frame);
-    var packet_reader = protocol.PacketReader.init(&frame_reader);
+    const packet_reader = protocol.PacketReader.init(&frame_reader);
     const frame_len = try packet_reader.readVarInt();
     const packet = try protocol.readPacketFrame(
         std.testing.allocator,
@@ -1677,7 +1677,7 @@ test "cached packets retain an uncompressed frame for compression mode" {
     defer cached.deinit(std.testing.allocator);
 
     var frame_reader: Io.Reader = .fixed(cached.uncompressed_frame);
-    var packet_reader = protocol.PacketReader.init(&frame_reader);
+    const packet_reader = protocol.PacketReader.init(&frame_reader);
     const frame_len = try packet_reader.readVarInt();
     const packet = try protocol.readPacketFrame(
         std.testing.allocator,
@@ -1693,11 +1693,7 @@ test "cached packets retain an uncompressed frame for compression mode" {
 test "optional movement traffic is dropped while a send is in flight" {
     if (comptime !features.movement) return error.SkipZigTest;
     var phase: Phase = .disconnected;
-    var test_session = try TestSession.init(std.testing.allocator, .{
-        .host = "127.0.0.1",
-        .port = 25565,
-        .username = "Zion0",
-    });
+    var test_session = try TestSession.init(std.testing.allocator, .{});
     defer test_session.deinit();
     try onConnected(&test_session.clients, 0, &phase, 100, &test_session.packet_builder_buf, &test_session.write_temp_buf);
     _ = beginWrite(&test_session.clients, 0);
@@ -1710,59 +1706,45 @@ test "optional movement traffic is dropped while a send is in flight" {
 }
 
 test "Session drains fragmented login compression packet" {
-    if (comptime !protocol.compression_enabled) {
-        return error.SkipZigTest;
-    } else {
-        const allocator = std.testing.allocator;
-        var phase: Phase = .disconnected;
-        var test_session = try TestSession.init(allocator, .{
-            .host = "127.0.0.1",
-            .port = 25565,
-            .username = "Zion0",
-        });
-        defer test_session.deinit();
-        try onConnected(&test_session.clients, 0, &phase, 100, &test_session.packet_builder_buf, &test_session.write_temp_buf);
-        test_session.clearWriteBuffer();
+    if (comptime !protocol.compression_enabled) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var phase: Phase = .disconnected;
+    var test_session = try TestSession.init(allocator, .{});
+    defer test_session.deinit();
+    try onConnected(&test_session.clients, 0, &phase, 100, &test_session.packet_builder_buf, &test_session.write_temp_buf);
+    test_session.clearWriteBuffer();
 
-        var packet = try protocol.PacketFrame.init(&test_session.packet_builder_buf, packet_ids.login.clientbound.set_compression);
-        try packet.writer.writeVarInt(256);
-        const frame = try packet.finish(.disabled);
-        defer allocator.free(frame);
+    var packet = try protocol.PacketFrame.init(&test_session.packet_builder_buf, packet_ids.login.clientbound.set_compression);
+    try packet.writer.writeVarInt(256);
+    const frame = try packet.finish(.disabled);
+    defer allocator.free(frame);
 
-        try appendReadBufferSlice(&test_session.clients, 0, frame[0..1]);
-        _ = try drainPackets(&test_session.clients, 0, &phase, &test_session.decompress_buf, test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
-        try std.testing.expectEqual(protocol.Compression.disabled, compressionState(&test_session.clients, 0).*);
+    try appendReadBufferSlice(&test_session.clients, 0, frame[0..1]);
+    _ = try drainPackets(&test_session.clients, 0, &phase, test_session.decompressBuf(), test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
+    try std.testing.expectEqual(protocol.Compression.disabled, compressionState(&test_session.clients, 0).*);
 
-        try appendReadBufferSlice(&test_session.clients, 0, frame[1..]);
-        _ = try drainPackets(&test_session.clients, 0, &phase, &test_session.decompress_buf, test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
-        try std.testing.expectEqual(protocol.Compression{ .enabled = 256 }, compressionState(&test_session.clients, 0).*);
-    }
+    try appendReadBufferSlice(&test_session.clients, 0, frame[1..]);
+    _ = try drainPackets(&test_session.clients, 0, &phase, test_session.decompressBuf(), test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
+    try std.testing.expectEqual(protocol.Compression{ .enabled = 256 }, compressionState(&test_session.clients, 0).*);
 }
 
 test "Session treats a negative compression threshold as disabled" {
-    if (comptime !protocol.compression_enabled) {
-        return error.SkipZigTest;
-    } else {
-        const allocator = std.testing.allocator;
-        var phase: Phase = .disconnected;
-        var test_session = try TestSession.init(allocator, .{
-            .host = "127.0.0.1",
-            .port = 25565,
-            .username = "Zion0",
-        });
-        defer test_session.deinit();
-        try onConnected(&test_session.clients, 0, &phase, 100, &test_session.packet_builder_buf, &test_session.write_temp_buf);
-        test_session.clearWriteBuffer();
+    if (comptime !protocol.compression_enabled) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var phase: Phase = .disconnected;
+    var test_session = try TestSession.init(allocator, .{});
+    defer test_session.deinit();
+    try onConnected(&test_session.clients, 0, &phase, 100, &test_session.packet_builder_buf, &test_session.write_temp_buf);
+    test_session.clearWriteBuffer();
 
-        var packet = try protocol.PacketFrame.init(&test_session.packet_builder_buf, packet_ids.login.clientbound.set_compression);
-        try packet.writer.writeVarInt(-1);
-        const frame = try packet.finish(.disabled);
-        defer allocator.free(frame);
+    var packet = try protocol.PacketFrame.init(&test_session.packet_builder_buf, packet_ids.login.clientbound.set_compression);
+    try packet.writer.writeVarInt(-1);
+    const frame = try packet.finish(.disabled);
+    defer allocator.free(frame);
 
-        try appendReadBufferSlice(&test_session.clients, 0, frame);
-        _ = try drainPackets(&test_session.clients, 0, &phase, &test_session.decompress_buf, test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
-        try std.testing.expectEqual(protocol.Compression.disabled, compressionState(&test_session.clients, 0).*);
-    }
+    try appendReadBufferSlice(&test_session.clients, 0, frame);
+    _ = try drainPackets(&test_session.clients, 0, &phase, test_session.decompressBuf(), test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf);
+    try std.testing.expectEqual(protocol.Compression.disabled, compressionState(&test_session.clients, 0).*);
 }
 
 test "Session frame parser rejects five continuation bytes without overflowing" {
@@ -1796,11 +1778,7 @@ fn fuzzSessionDrainPackets(_: void, smith: *std.testing.Smith) anyerror!void {
         .configuration => .configuration,
         .play => .play,
     };
-    var test_session = try TestSession.init(std.testing.allocator, .{
-        .host = "127.0.0.1",
-        .port = 25565,
-        .username = "Fuzz",
-    });
+    var test_session = try TestSession.init(std.testing.allocator, .{ .username = "Fuzz" });
     defer test_session.deinit();
 
     const InputShape = enum(u2) {
@@ -1839,7 +1817,7 @@ fn fuzzSessionDrainPackets(_: void, smith: *std.testing.Smith) anyerror!void {
         },
     }
 
-    _ = drainPackets(&test_session.clients, 0, &phase, &test_session.decompress_buf, test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf) catch |err| switch (err) {
+    _ = drainPackets(&test_session.clients, 0, &phase, test_session.decompressBuf(), test_session.decompress_window, &test_session.packet_builder_buf, &test_session.write_temp_buf) catch |err| switch (err) {
         error.Disconnected,
         error.ServerDisconnected,
         error.EndOfStream,

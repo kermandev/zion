@@ -35,12 +35,31 @@ const StoredSource = enum(u8) {
     client_tick_uncompressed,
     client_tick_compressed,
 
+    // SharedSource maps onto the tail of this enum by adding the number of
+    // owned variants, which must therefore come first and in the same order.
+    const shared_offset = @intFromEnum(StoredSource.broadcast_plain);
+
+    comptime {
+        const shared_info = @typeInfo(SharedSource).@"enum";
+        const stored_info = @typeInfo(StoredSource).@"enum";
+        std.debug.assert(stored_info.field_names.len == shared_offset + shared_info.field_names.len);
+        for (
+            shared_info.field_names,
+            shared_info.field_values,
+            stored_info.field_names[shared_offset..],
+            stored_info.field_values[shared_offset..],
+        ) |shared_name, shared_value, stored_name, stored_value| {
+            std.debug.assert(std.mem.eql(u8, shared_name, stored_name));
+            std.debug.assert(shared_value + shared_offset == stored_value);
+        }
+    }
+
     fn owned(slot: u1) StoredSource {
         return if (slot == 0) .owned_0 else .owned_1;
     }
 
     fn shared(source: SharedSource) StoredSource {
-        return @enumFromInt(@intFromEnum(source) + 2);
+        return @enumFromInt(@intFromEnum(source) + shared_offset);
     }
 
     fn ownedSlot(source: StoredSource) ?u1 {
@@ -53,12 +72,14 @@ const StoredSource = enum(u8) {
 
     fn sharedSource(source: StoredSource) ?SharedSource {
         const raw = @intFromEnum(source);
-        return if (raw >= 2) @enumFromInt(raw - 2) else null;
+        return if (raw >= shared_offset) @enumFromInt(raw - shared_offset) else null;
     }
 };
 
 const QueueState = packed struct(u8) {
-    head: u2 = 0,
+    // Sized so it wraps at segment_capacity (a power of two) on overflow;
+    // complete() relies on that instead of a modulo.
+    head: std.math.IntFittingRange(0, segment_capacity - 1) = 0,
     count: u3 = 0,
     // Number of segments (from the head, in logical order) whose bytes are in
     // flight in one gathered send. Their storage must stay stable until
@@ -105,22 +126,19 @@ pub const Queue = struct {
         if (bytes.len == 0) return;
         try self.ensureQueueCapacity(bytes.len);
 
-        if (self.state.count > 0) {
+        if (self.state.count > 0) coalesce: {
             const tail_logical: u3 = self.state.count - 1;
             const tail_index = self.physicalIndex(tail_logical);
-            // Only extend storage whose live bytes still start at offset zero.
-            // After a partial send, use the other owned slot so sent prefixes
-            // cannot accumulate across repeated append/send cycles.
-            if (self.sources[tail_index].ownedSlot()) |slot| {
-                if (self.offsets[tail_index] != 0 or tail_logical < self.state.inflight) {
-                    // The tail cannot be extended while its storage is in flight.
-                } else {
-                    try self.appendOwned(allocator, slot, bytes);
-                    self.lengths[tail_index] = self.owned_lens[slot];
-                    self.queued_bytes += @intCast(bytes.len);
-                    return;
-                }
-            }
+            const slot = self.sources[tail_index].ownedSlot() orelse break :coalesce;
+            // Extend the tail only while its live bytes still start at offset zero
+            // and its storage is not in flight. After a partial send the other
+            // owned slot is used instead, so sent prefixes cannot accumulate
+            // across repeated append/send cycles.
+            if (self.offsets[tail_index] != 0 or tail_logical < self.state.inflight) break :coalesce;
+            try self.appendOwned(allocator, slot, bytes);
+            self.lengths[tail_index] = self.owned_lens[slot];
+            self.queued_bytes += @intCast(bytes.len);
+            return;
         }
 
         if (self.state.count == segment_capacity) return error.QueueFull;
@@ -141,7 +159,10 @@ pub const Queue = struct {
     /// Locks every queued segment for one gathered send and fills `out` with
     /// their pending views in FIFO order. Returns the segment count.
     pub fn beginAll(self: *Queue, out: *[segment_capacity]Pending) u8 {
-        const count = self.state.count;
+        // count never exceeds segment_capacity, but its u3 type does not say so;
+        // the @min gives LLVM the trip count and stops it unrolling 7 copies of
+        // pendingAt into armSend.
+        const count = @min(self.state.count, segment_capacity);
         for (0..count) |logical| out[logical] = self.pendingAt(@intCast(logical));
         self.state.inflight = count;
         return count;
@@ -192,7 +213,7 @@ pub const Queue = struct {
             }
             left -= remaining;
             if (self.sources[head].ownedSlot()) |slot| self.owned_lens[slot] = 0;
-            self.state.head = @intCast((@as(usize, head) + 1) % segment_capacity);
+            self.state.head +%= 1;
             self.state.count -= 1;
         }
         if (self.state.count == 0) self.state.head = 0;
@@ -206,45 +227,46 @@ pub const Queue = struct {
 
     pub fn reset(self: *Queue, allocator: std.mem.Allocator, preserve_inflight: bool) void {
         const inflight = self.state.inflight;
-        if (preserve_inflight and inflight > 0 and self.state.count > 0) {
-            // Keep every in-flight segment: the kernel may still read any of
-            // their bytes until the gathered send completes.
-            var preserved_owned = [2]bool{ false, false };
-            var sources: [segment_capacity]StoredSource = undefined;
-            var offsets: [segment_capacity]u16 = undefined;
-            var lengths: [segment_capacity]u16 = undefined;
-            var preserved_bytes: usize = 0;
-            for (0..inflight) |logical| {
-                const index = self.physicalIndex(@intCast(logical));
-                sources[logical] = self.sources[index];
-                offsets[logical] = self.offsets[index];
-                lengths[logical] = self.lengths[index];
-                if (self.sources[index].ownedSlot()) |slot| preserved_owned[slot] = true;
-                preserved_bytes += self.lengths[index] - self.offsets[index];
-            }
-            for (&self.owned_buffers, 0..) |*buffer, slot| {
-                if (preserved_owned[slot]) continue;
-                if (buffer.*) |bytes| allocator.free(bytes[0..self.owned_capacities[slot]]);
-                buffer.* = null;
-                self.owned_capacities[slot] = 0;
-                self.owned_lens[slot] = 0;
-            }
-            for (0..inflight) |logical| {
-                self.sources[logical] = sources[logical];
-                self.offsets[logical] = offsets[logical];
-                self.lengths[logical] = lengths[logical];
-            }
-            self.state = .{ .count = inflight, .inflight = inflight };
-            self.queued_bytes = @intCast(preserved_bytes);
+        if (!preserve_inflight or inflight == 0 or self.state.count == 0) {
+            self.freeOwnedBuffers(allocator, .{ false, false });
+            self.clearRetainingCapacity();
             return;
         }
 
+        // Keep every in-flight segment: the kernel may still read any of their
+        // bytes until the gathered send completes.
+        const Segment = struct { source: StoredSource, offset: u16, len: u16 };
+        var preserved: [segment_capacity]Segment = undefined;
+        var keep_owned = [2]bool{ false, false };
+        var preserved_bytes: usize = 0;
+        for (preserved[0..inflight], 0..) |*segment, logical| {
+            const index = self.physicalIndex(@intCast(logical));
+            segment.* = .{
+                .source = self.sources[index],
+                .offset = self.offsets[index],
+                .len = self.lengths[index],
+            };
+            if (segment.source.ownedSlot()) |slot| keep_owned[slot] = true;
+            preserved_bytes += segment.len - segment.offset;
+        }
+        self.freeOwnedBuffers(allocator, keep_owned);
+        for (preserved[0..inflight], 0..) |segment, logical| {
+            self.sources[logical] = segment.source;
+            self.offsets[logical] = segment.offset;
+            self.lengths[logical] = segment.len;
+        }
+        self.state = .{ .count = inflight, .inflight = inflight };
+        self.queued_bytes = @intCast(preserved_bytes);
+    }
+
+    fn freeOwnedBuffers(self: *Queue, allocator: std.mem.Allocator, keep: [2]bool) void {
         for (&self.owned_buffers, 0..) |*buffer, slot| {
+            if (keep[slot]) continue;
             if (buffer.*) |bytes| allocator.free(bytes[0..self.owned_capacities[slot]]);
             buffer.* = null;
             self.owned_capacities[slot] = 0;
+            self.owned_lens[slot] = 0;
         }
-        self.clearRetainingCapacity();
     }
 
     fn ensureQueueCapacity(self: *const Queue, additional: usize) error{TooLarge}!void {
@@ -267,7 +289,8 @@ pub const Queue = struct {
 
     fn freeOwnedSlot(self: *const Queue) ?u1 {
         var used = [2]bool{ false, false };
-        for (0..self.state.count) |logical| {
+        // See beginAll: the @min bounds the unroll at segment_capacity.
+        for (0..@min(self.state.count, segment_capacity)) |logical| {
             const source = self.sources[self.physicalIndex(@intCast(logical))];
             if (source.ownedSlot()) |slot| used[slot] = true;
         }

@@ -11,6 +11,7 @@ pub const Stats = struct {
     connected: u64 = 0,
     waiting: u64 = 0,
     connecting: u64 = 0,
+    stopped: u64 = 0,
     play: u64 = 0,
     reconnects: u64 = 0,
     packets_received: u64 = 0,
@@ -25,6 +26,7 @@ pub const Stats = struct {
         stats.connected += other.connected;
         stats.waiting += other.waiting;
         stats.connecting += other.connecting;
+        stats.stopped += other.stopped;
         stats.play += other.play;
         stats.reconnects += other.reconnects;
         stats.packets_received += other.packets_received;
@@ -35,29 +37,33 @@ pub const Stats = struct {
     }
 };
 
-pub fn collectStats(clients: *client.ClientTable) Stats {
-    var stats: Stats = .{ .requested = clients.global_indices.items.len };
-    const pool = clients.pool.slice();
-    const states = pool.items(.state);
+pub fn collectStats(clients: *const client.ClientTable) Stats {
+    const states = clients.pool.slice().items(.state);
     const phases = clients.phases.items;
-    for (0..clients.global_indices.items.len) |i| {
-        switch (states[i]) {
+    // Columns grow in lockstep via appendAssumeCapacity and are never removed from.
+    std.debug.assert(states.len == phases.len);
+
+    var stats: Stats = .{ .requested = states.len };
+    for (states, phases) |state, phase| {
+        switch (state) {
             .waiting, .draining => stats.waiting += 1,
             .connecting => stats.connecting += 1,
             .connected => stats.connected += 1,
+            .stopped => stats.stopped += 1,
         }
-        if (phases[i] == .play) stats.play += 1;
+        if (phase == .play) stats.play += 1;
     }
     return stats;
 }
 
 pub fn shardCount(requested: ?usize, client_count: usize) usize {
     if (client_count == 0) return 1;
-    const default_clients_per_shard = 200;
-    const cpu_count = std.Thread.getCpuCount() catch 1;
-    const default_shards = @min(std.math.divCeil(usize, client_count, default_clients_per_shard) catch 1, cpu_count);
-    const normalized = @max(requested orelse default_shards, 1);
-    return @min(normalized, client_count);
+    const shards = requested orelse default: {
+        const clients_per_shard = 200;
+        const cpu_count = std.Thread.getCpuCount() catch 1;
+        break :default @min(std.math.divCeil(usize, client_count, clients_per_shard) catch 1, cpu_count);
+    };
+    return std.math.clamp(shards, 1, client_count);
 }
 
 pub fn partitionBots(allocator: std.mem.Allocator, client_count: usize, shard_count: usize) ![][]IndexedBot {

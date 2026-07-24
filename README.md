@@ -112,8 +112,18 @@ zion \
   --clients 1000
 ```
 
-The server or proxy must expose Minecraft over a filesystem Unix stream socket.
-The CLI does not support Linux abstract namespace sockets.
+A leading `@` selects the Linux abstract namespace instead of a filesystem path,
+matching the spelling `ss` and systemd use:
+
+```sh
+zion --target unix:@minecraft --clients 1000
+```
+
+Abstract names live outside the filesystem, so they have no permissions and
+vanish with the listening process. The name is taken verbatim after the `@` and
+is not NUL terminated, so `unix:@minecraft` reaches a server that bound exactly
+`\0minecraft`. Filesystem paths may be up to 108 bytes; abstract names up to 107,
+since one byte goes to the leading NUL.
 
 ### Workloads
 
