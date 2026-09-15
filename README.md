@@ -8,7 +8,7 @@ clients from one process.
 
 - Linux 6.7 or newer with `io_uring` support.
 - Zig 0.17. The current tree is tested with
-  `0.17.0-dev.1415+64dfaa568`.
+  `0.17.0-dev.1569+5f74e4f3f`.
 - A Minecraft Java server that accepts offline mode clients.
 
 Zion does not support macOS or Windows. It uses `std.Io` for readers, writers,
@@ -66,6 +66,8 @@ zig build -Doptimize=ReleaseFast -Dminimal=true -Denable-compression=true
 | `-Denable-broadcast`   | `true`   | Periodic chat messages                              |
 | `-Denable-client-tick` | `true`   | 50 ms client tick packets                           |
 | `-Denable-diagnostics` | `true`   | Join progress, disconnect causes, and ring pressure |
+| `-Denable-reconnect`   | `true`   | Automatic reconnect of dropped clients              |
+| `-Denable-tui`         | `true`   | Full-screen terminal dashboard                      |
 | `-Dminecraft-version`  | `latest` | `latest` or an entry from the version catalog       |
 
 ## Run
@@ -81,6 +83,44 @@ zion --target 127.0.0.1:25565 --clients 1000
 ```
 
 Run `zion --help` to see every runtime option.
+
+### Dashboard
+
+When stdout and stdin are both terminals, Zion opens a full-screen dashboard for
+the run. It has five panes, reachable with `1`–`5`:
+
+| Pane | Shows |
+|------|-------|
+| `1` fleet | Headline gauges, the receive chart, per-shard health, disconnect causes |
+| `2` shards | Every shard as a sortable row; `enter` drills into one |
+| `3` traffic | Receive, send and packet charts with now/average/peak figures |
+| `4` diagnostics | Ring pressure, the keepalive latency distribution, disconnect causes |
+| `5` log | Joins, drops, reconnects and protocol errors as they happen |
+
+`s` opens the stats overlay — the same block that prints at the end of the run —
+on every pane except shards, where it cycles the sort column instead; the shard
+drill-down counts as the shards pane. `p` pauses sampling without pausing the
+run, `c` copies the stats block to the clipboard, and `q` quits.
+
+`enter` opens the selected shard from the fleet, shards or diagnostics pane, and
+`esc` backs out to whichever one you came from. `←→` changes the chart span,
+except on the log pane where there is no chart and they walk the filter strip
+instead. Every pane lists its own keys along the bottom.
+
+When the fleet is in trouble the strip says so; `space` on the fleet pane opens
+the alert view, which names the failing signals and the shards involved. The
+dashboard never switches to it on its own, and the degraded state is held until
+it has been steady for a while, so a signal hovering on its threshold cannot
+pull the screen out from under you.
+
+The dashboard is released with the alternate screen when the run ends, so
+nothing it drew survives; what lands in scrollback is the usual `stats:` block
+followed by the run's peaks.
+
+Pass `--no-tui` for the single-line progress output instead. A redirected or
+piped stdout uses that automatically, as does a redirected, piped or closed
+stdin — the dashboard puts stdin in raw mode to read keys, so it needs a
+terminal on both. A build without `-Denable-tui` has no dashboard at all.
 
 ### Transport targets
 

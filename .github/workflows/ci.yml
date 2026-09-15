@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  ZIG_VERSION: 0.17.0-dev.1415+64dfaa568
+  ZIG_VERSION: 0.17.0-dev.1569+5f74e4f3f
 
 jobs:
   format:
@@ -40,6 +40,12 @@ jobs:
             options: -Denable-compression=false
           - name: no-periodic-traffic
             options: -Denable-movement=false -Denable-broadcast=false -Denable-client-tick=false
+          - name: no-stats
+            options: -Denable-stats=false
+          - name: no-tui
+            options: -Denable-tui=false
+          - name: no-diagnostics
+            options: -Denable-diagnostics=false
           - name: release-safe
             options: -Doptimize=ReleaseSafe
     steps:

@@ -18,6 +18,9 @@ const ProgressSink = progress_module.ProgressSink;
 const ShardProgress = progress_module.ShardProgress;
 const waitForSharedProgress = progress_module.waitForSharedProgress;
 
+const telemetry = @import("telemetry.zig");
+pub const tui = @import("tui.zig");
+
 const client_table = @import("client_table.zig");
 const IndexedBot = client_table.IndexedBot;
 const ConnectionState = client.ConnectionState;
@@ -74,6 +77,9 @@ pub const Options = struct {
     username_prefix: []const u8 = "Zion",
     known_core_pack: bool = false,
     join_progress: ?*JoinProgress = null,
+    // When set, the dashboard owns the main thread for the run's duration and
+    // the plain progress line stays silent.
+    dashboard: if (tui.enabled) ?*tui.Dashboard else void = if (tui.enabled) null else {},
 };
 
 const max_backoff_ms: u64 = 30_000;
@@ -94,6 +100,11 @@ const ShardContext = struct {
     total_client_count: usize,
     shard_id: usize,
     stats: Stats = .{},
+    dashboard_shard: if (tui.enabled) ?*telemetry.Shard else void = if (tui.enabled) null else {},
+    /// Why this shard gave up, reported by `run` once the threads are joined.
+    /// A shard cannot report it itself: the terminal belongs to the dashboard
+    /// on the main thread, and exiting from here would race its setup.
+    err: ?anyerror = null,
 };
 
 const LoopContext = struct {
@@ -118,6 +129,18 @@ const LoopContext = struct {
     tcp_nodelay: i32 = 1,
     reconnect: bool = features.reconnect,
     aggregate: Stats = .{},
+    // Dashboard-only shard state. The counters the dashboard shares with the
+    // stats block are read straight out of `aggregate`; only the distributions
+    // it alone needs are tracked here.
+    dashboard_shard: if (tui.enabled) ?*telemetry.Shard else void = if (tui.enabled) null else {},
+    keep_alive_histogram: if (tui.enabled) telemetry.Histogram else void = if (tui.enabled) .{} else {},
+    rejoin_histogram: if (tui.enabled) telemetry.Histogram else void = if (tui.enabled) .{} else {},
+    // What the server asked for, latched once a client gets past login.
+    compression: if (tui.enabled) telemetry.CompressionState else void = if (tui.enabled) .unknown else {},
+    compression_threshold: i32 = 0,
+    last_publish_ms: u64 = 0,
+    started_ms: u64 = 0,
+    shard_id: u16 = 0,
 };
 
 pub fn run(
@@ -137,8 +160,12 @@ pub fn run(
     const shards = client_table.shardCount(options.shards, count);
     const partitions = try client_table.partitionBots(allocator, count, shards);
     defer client_table.freeBotPartitions(allocator, partitions);
-    if (shards == 1) {
-        var stats = try runShardLoop(io, allocator, partitions[0], resolved_target, options, ProgressSink.init(options.join_progress), count);
+
+    const dashboard_active = if (comptime tui.enabled) options.dashboard != null else false;
+    // The dashboard needs the main thread to render on, so even a single shard
+    // gets its own thread; without one, the shard runs here as it always has.
+    if (shards == 1 and !dashboard_active) {
+        var stats = try runShardLoop(io, allocator, partitions[0], resolved_target, options, ProgressSink.init(options.join_progress), count, 0, null);
         stats.duration_ms = monotonicMs(io) -| started_ms;
         return stats;
     }
@@ -149,26 +176,55 @@ pub fn run(
     const contexts = try allocator.alloc(ShardContext, shards);
     defer allocator.free(contexts);
 
-    const shard_progress: ProgressSink = .none;
+    // The dashboard's per-shard slots embed the progress counters, so a
+    // dashboard run publishes both from one allocation and nothing is counted
+    // twice.
+    var dashboard_shards: if (tui.enabled) ?[]telemetry.Shard else void = if (tui.enabled) null else {};
+    defer if (comptime tui.enabled) {
+        if (dashboard_shards) |slots| allocator.free(slots);
+    };
+    if (comptime tui.enabled) {
+        if (dashboard_active) {
+            const slots = try allocator.alloc(telemetry.Shard, shards);
+            for (slots) |*slot| slot.* = .{};
+            dashboard_shards = slots;
+        }
+    }
+
     var progress_counters: ?[]ShardProgress = null;
-    if (options.join_progress) |progress| {
-        if (progress.enabled) {
-            const counters = try allocator.alloc(ShardProgress, shards);
-            for (counters) |*counter| counter.* = .{};
-            progress_counters = counters;
+    if (!dashboard_active) {
+        if (options.join_progress) |progress| {
+            if (progress.enabled) {
+                const counters = try allocator.alloc(ShardProgress, shards);
+                for (counters) |*counter| counter.* = .{};
+                progress_counters = counters;
+            }
         }
     }
     defer if (progress_counters) |counters| allocator.free(counters);
 
     for (partitions, 0..) |partition, shard_id| {
+        const dashboard_shard = if (comptime tui.enabled)
+            (if (dashboard_shards) |slots| &slots[shard_id] else null)
+        else {};
+        // The dashboard's slot carries the progress counters, so only one of
+        // the two allocations is ever in play for a given run.
+        const sink: ProgressSink = sink: {
+            if (comptime tui.enabled) {
+                if (dashboard_shard) |slot| break :sink .{ .shared = &slot.progress };
+            }
+            if (progress_counters) |counters| break :sink .{ .shared = &counters[shard_id] };
+            break :sink .none;
+        };
         contexts[shard_id] = .{
             .io = io,
             .bots = partition,
             .resolved_target = resolved_target,
             .options = options,
-            .progress = if (progress_counters) |counters| .{ .shared = &counters[shard_id] } else shard_progress,
+            .progress = sink,
             .total_client_count = count,
             .shard_id = shard_id,
+            .dashboard_shard = dashboard_shard,
         };
         threads[shard_id] = std.Thread.spawn(.{}, shardThreadMain, .{
             &contexts[shard_id],
@@ -178,9 +234,23 @@ pub fn run(
         };
     }
 
+    if (comptime tui.enabled) {
+        if (dashboard_shards) |slots| tui.run(io, allocator, options.dashboard.?, slots, &stop_requested);
+    }
     if (progress_counters) |counters| waitForSharedProgress(options.join_progress.?, counters);
 
     for (threads) |thread| thread.join();
+
+    // Every thread is joined and the dashboard has put the terminal back, so a
+    // failure can finally be printed where the user will see it.
+    for (contexts) |context| {
+        const err = context.err orelse continue;
+        // Exiting here skips `runLoad`'s errdefer, so the progress line has to
+        // be closed first or the message lands glued to its tail.
+        if (options.join_progress) |progress| progress.end();
+        printStderr(io, "error: shard {d} loop failed: {t}\n", .{ context.shard_id, err });
+        std.process.exit(1);
+    }
 
     var stats: Stats = .{};
     for (contexts) |context| stats.add(context.stats);
@@ -198,9 +268,18 @@ fn shardThreadMain(context: *ShardContext) void {
         context.options,
         context.progress,
         context.total_client_count,
+        context.shard_id,
+        if (comptime tui.enabled) context.dashboard_shard else null,
     ) catch |err| {
-        printStderr(context.io, "error: shard {d} loop failed: {t}\n", .{ context.shard_id, err });
-        std.process.exit(1);
+        // Reported by `run` rather than here. A shard thread that restored the
+        // terminal and exited would race `Term.init` on the main thread, which
+        // is still setting it up: every shard is spawned before the dashboard
+        // opens. Returning normally also lets the `shardDone` defer above fire,
+        // which is what lets the dashboard and the progress line notice the run
+        // is over.
+        context.err = err;
+        stop_requested.store(true, .monotonic);
+        return;
     };
 }
 
@@ -212,6 +291,8 @@ fn runShardLoop(
     options: Options,
     progress: ProgressSink,
     total_client_count: usize,
+    shard_id: usize,
+    dashboard_shard: if (tui.enabled) ?*telemetry.Shard else @TypeOf(null),
 ) !Stats {
     var clients: ClientTable = .{
         .allocator = allocator,
@@ -316,8 +397,18 @@ fn runShardLoop(
         .send_iovecs = send_iovecs,
         .send_msghdrs = send_msghdrs,
         .reconnect = features.reconnect and options.reconnect,
+        .dashboard_shard = if (comptime tui.enabled) dashboard_shard else {},
+        .started_ms = now,
+        .shard_id = @intCast(shard_id),
     };
-    if (comptime diagnostics_enabled) ctx.aggregate.diagnostics.observeCq(0, @intCast(ring.cq.cqes.len));
+    if (comptime diagnostics_enabled) {
+        ctx.aggregate.diagnostics.observeCq(0, @intCast(ring.cq.cqes.len));
+        // Settled once, at registration: a pre-6.12 kernel rejects the flag and
+        // the run falls back to retiring a whole buffer per completion. Without
+        // this the two regimes are indistinguishable after the fact, and they
+        // differ by the ring's whole effective capacity.
+        ctx.aggregate.diagnostics.incremental_buffers = recv_buffers.incremental;
+    }
 
     var loop_now = now;
     while (!shouldStop()) {
@@ -347,11 +438,15 @@ fn runShardLoop(
             try processUringEvent(&ctx, event, key, loop_now, progress);
         }
         trimScratchBuffers(&ctx);
+        publishTelemetry(&ctx, loop_now, false);
     }
 
     if (comptime diagnostics_enabled) {
         ctx.aggregate.diagnostics.cq_overflow = @atomicLoad(u32, ring.cq.overflow, .monotonic);
     }
+    // One last publication so the final frame reflects where the shard stopped
+    // rather than the last rate-limited tick.
+    publishTelemetry(&ctx, monotonicMs(io), true);
     var stats = collectStats(&clients);
     if (stats_enabled) {
         stats.reconnects = ctx.aggregate.reconnects;
@@ -362,6 +457,97 @@ fn runShardLoop(
     }
     if (comptime diagnostics_enabled) stats.diagnostics = ctx.aggregate.diagnostics;
     return stats;
+}
+
+// Copies the shard's counters into its dashboard slot. Rate-limited to
+// `publish_interval_ms`: the renderer samples far more slowly than this loop
+// spins, so republishing on every iteration would be pure overhead.
+fn publishTelemetry(ctx: *LoopContext, now_ms: u64, force: bool) void {
+    if (comptime !tui.enabled) return;
+    const slot = ctx.dashboard_shard orelse return;
+    if (!force and now_ms -| ctx.last_publish_ms < telemetry.publish_interval_ms) return;
+    ctx.last_publish_ms = now_ms;
+
+    observeCompression(ctx, now_ms);
+    const states = collectStats(ctx.clients);
+    var snapshot: telemetry.Snapshot = .{
+        .bytes_received = ctx.aggregate.bytes_received,
+        .bytes_sent = ctx.aggregate.bytes_sent,
+        .packets_received = ctx.aggregate.packets_received,
+        .keep_alives = ctx.aggregate.keep_alives_answered,
+        .connected = @intCast(states.connected),
+        .connecting = @intCast(states.connecting),
+        .waiting = @intCast(states.waiting),
+        .stopped = @intCast(states.stopped),
+        .play = @intCast(states.play),
+        .keep_alive = ctx.keep_alive_histogram,
+        .rejoin = ctx.rejoin_histogram,
+        .compression = ctx.compression,
+        .compression_threshold = ctx.compression_threshold,
+    };
+    if (comptime diagnostics_enabled) {
+        const diagnostics = ctx.aggregate.diagnostics;
+        snapshot.peak_cq_ready = diagnostics.max_cq_ready;
+        snapshot.peak_cq_entries = diagnostics.max_cq_entries;
+        snapshot.recv_nobufs = diagnostics.recv_nobufs;
+        // Read live rather than reusing the end-of-run copy, so a ring under
+        // pressure shows up while it is happening.
+        snapshot.cq_overflow = @atomicLoad(u32, ctx.ring.cq.overflow, .monotonic);
+        snapshot.close_failures = diagnostics.close_failures;
+        snapshot.max_bundle_bytes = diagnostics.max_recv_bundle_bytes;
+        snapshot.max_bundle_buffers = diagnostics.max_recv_bundle_buffers;
+        snapshot.incremental_buffers = diagnostics.incremental_buffers;
+        inline for (comptime std.enums.values(telemetry.DisconnectCategory)) |category| {
+            snapshot.disconnects[@backingInt(category)] = telemetry.disconnectCount(diagnostics.disconnects, category);
+        }
+    }
+    slot.publish(snapshot);
+}
+
+// What the server negotiated, as opposed to what the binary was built to do.
+//
+// Compression is settled during login: a server that wants it sends
+// `set_compression` before the client leaves that phase, and one that does not
+// simply never mentions it. So any client that has reached configuration or
+// play has its answer, and every client on the shard is talking to the same
+// server. The first such client is therefore the whole answer, which is why
+// this stops at it rather than scanning the table.
+fn observeCompression(ctx: *LoopContext, now_ms: u64) void {
+    if (comptime !tui.enabled) return;
+    if (comptime !client.protocol.compression_enabled) return;
+    // Once seen it cannot change: the threshold is per connection, and a
+    // reconnecting client renegotiates the same one.
+    if (ctx.compression != .unknown) return;
+
+    const phases = ctx.clients.phases.items;
+    for (phases, 0..) |phase, index| {
+        switch (phase) {
+            .configuration, .play => {},
+            else => continue,
+        }
+        const state = client.compressionState(ctx.clients, index).*;
+        ctx.compression = if (state.threshold() != null) .on else .off;
+        ctx.compression_threshold = state.threshold() orelse 0;
+        if (ctx.compression == .on) {
+            // The one event kind the log pane could render but nothing ever
+            // produced.
+            recordEvent(ctx, now_ms, .{
+                .kind = .compression_on,
+                .fleet = true,
+                .value = @intCast(@max(0, ctx.compression_threshold)),
+            });
+        }
+        return;
+    }
+}
+
+fn recordEvent(ctx: *LoopContext, now_ms: u64, event: telemetry.Event) void {
+    if (comptime !tui.enabled) return;
+    const slot = ctx.dashboard_shard orelse return;
+    var stamped = event;
+    stamped.shard = ctx.shard_id;
+    stamped.at_ms = now_ms -| ctx.started_ms;
+    slot.events.push(stamped);
 }
 
 fn trimScratchBuffers(ctx: *const LoopContext) void {
@@ -587,9 +773,11 @@ fn handleRecvReady(
     defer ctx.recv_buffers.releaseBatch(release_batch);
     if (comptime diagnostics_enabled) {
         const batch_bytes: u64 = @intCast(event.res);
-        // buffer_size is a power of two; shift instead of a hardware divide.
-        const size: u64 = ctx.recv_buffers.buffer_size;
-        const batch_buffers: u32 = @intCast((batch_bytes + size - 1) >> @intCast(@ctz(size)));
+        // Asked of the batch rather than derived from the byte count: under
+        // incremental consumption a completion can start part-way into a
+        // buffer, so the same number of bytes can span one buffer more than
+        // rounding them up would suggest. Read before the batch is consumed.
+        const batch_buffers = batch.bufferSpan();
         ctx.aggregate.diagnostics.max_recv_bundle_bytes = @max(ctx.aggregate.diagnostics.max_recv_bundle_bytes, batch_bytes);
         ctx.aggregate.diagnostics.max_recv_bundle_buffers = @max(ctx.aggregate.diagnostics.max_recv_bundle_buffers, batch_buffers);
     }
@@ -625,7 +813,7 @@ fn handleRecvReady(
             noteKeepAliveQueued(ctx, index, pending_bytes, now_ms);
         }
     }
-    if (read_result.effects.progress_changed) recordJoinProgress(ctx.clients, index, progress);
+    if (read_result.effects.progress_changed) recordJoinProgress(ctx, index, progress, now_ms);
     if (read_result.effects.deadline_changed) scheduleClient(ctx, index);
     if (read_result.effects.write_ready) try armSend(ctx, index);
 
@@ -742,7 +930,7 @@ fn startConnect(ctx: *const LoopContext, index: usize) !void {
     pool.items(.connect_generation)[index] +%= 1;
     errdefer pool.items(.state)[index] = .waiting;
     const socket_protocol: u32 = switch (ctx.address) {
-        .ip => @intFromEnum(Io.net.Protocol.tcp),
+        .ip => @backingInt(Io.net.Protocol.tcp),
         .unix => 0,
     };
     try queueSocketDirect(ctx.ring, packCompletionKey(.{
@@ -844,7 +1032,8 @@ noinline fn warnDisconnect(
     }
 }
 
-fn recordJoinProgress(clients: *ClientTable, index: usize, progress: ProgressSink) void {
+fn recordJoinProgress(ctx: *LoopContext, index: usize, progress: ProgressSink, now_ms: u64) void {
+    const clients = ctx.clients;
     const pool = clients.pool.slice();
     if (!client.joinedLogged(clients, index).*) return;
     // Real progress reached: safe to reset backoff so a healthy client that
@@ -856,6 +1045,28 @@ fn recordJoinProgress(clients: *ClientTable, index: usize, progress: ProgressSin
     pool.items(.flags)[index].progress_active = true;
     pool.items(.flags)[index].progress_counted = true;
     progress.enterPlay(!was_counted);
+    noteRejoin(ctx, index, now_ms);
+}
+
+// A client re-entering play after a drop is a rejoin; the first join is not.
+fn noteRejoin(ctx: *LoopContext, index: usize, now_ms: u64) void {
+    if (comptime !tui.enabled) return;
+    if (ctx.dashboard_shard == null) return;
+    var rejoin_ms: u64 = 0;
+    if (comptime stats_module.dashboard_columns_enabled) {
+        const stats = ctx.clients.stats.slice();
+        const dropped_at = stats.items(.disconnected_at_ms)[index];
+        if (dropped_at != 0) {
+            rejoin_ms = (now_ms -| ctx.started_ms) -| dropped_at;
+            ctx.rejoin_histogram.record(rejoin_ms);
+            stats.items(.disconnected_at_ms)[index] = 0;
+        }
+    }
+    recordEvent(ctx, now_ms, .{
+        .kind = .entered_play,
+        .client = ctx.clients.global_indices.items[index],
+        .value = rejoin_ms,
+    });
 }
 
 fn scheduleClient(ctx: *const LoopContext, index: usize) void {
@@ -900,9 +1111,43 @@ fn failRuntime(ctx: *LoopContext, index: usize, err: anyerror, now_ms: u64, prog
             @intCast(index),
         );
     }
+    const was_active = pool.items(.flags)[index].progress_active;
     failClient(ctx.clients, index, err, now_ms, progress, ctx.target, ctx.reconnect);
     if (stats_enabled and ctx.reconnect) ctx.aggregate.reconnects += 1;
+    noteDisconnect(ctx, index, err, now_ms, was_active);
     scheduleClient(ctx, index);
+}
+
+fn noteDisconnect(ctx: *LoopContext, index: usize, err: anyerror, now_ms: u64, was_active: bool) void {
+    if (comptime !tui.enabled) return;
+    if (ctx.dashboard_shard == null) return;
+
+    // Only a client that had reached play can rejoin; one that never got there
+    // is still on its first attempt.
+    if (comptime stats_module.dashboard_columns_enabled) {
+        // Stored relative to the shard's start so it fits 32 bits; a client
+        // that drops in the first millisecond keeps the "never dropped" zero,
+        // which costs nothing but a missing rejoin time for that one client.
+        if (was_active) ctx.clients.stats.slice().items(.disconnected_at_ms)[index] = @truncate(now_ms -| ctx.started_ms);
+    }
+
+    const category = telemetry.DisconnectCategory.fromError(err);
+    const global_index = ctx.clients.global_indices.items[index];
+    recordEvent(ctx, now_ms, .{
+        .kind = if (category == .protocol) .protocol_error else .disconnect,
+        .category = category,
+        .client = global_index,
+    });
+
+    const pool = ctx.clients.pool.slice();
+    const reconnecting = features.reconnect and ctx.reconnect and pool.items(.state)[index] != .stopped;
+    if (!reconnecting) return;
+    recordEvent(ctx, now_ms, .{
+        .kind = .reconnect,
+        .category = category,
+        .client = global_index,
+        .value = pool.items(.next_attempt_ms)[index] -| now_ms,
+    });
 }
 
 fn noteKeepAliveQueued(ctx: *const LoopContext, index: usize, pending_bytes: u16, now_ms: u64) void {
@@ -923,9 +1168,26 @@ fn noteKeepAliveSendProgress(ctx: *LoopContext, index: usize, sent_bytes: usize,
     }
 
     const started_ms = stats.items(.keep_alive_started_ms)[index];
-    ctx.aggregate.diagnostics.recordKeepAliveSend(now_ms -| started_ms);
+    const latency_ms = now_ms -| started_ms;
+    ctx.aggregate.diagnostics.recordKeepAliveSend(latency_ms);
     stats.items(.keep_alive_started_ms)[index] = 0;
     stats.items(.keep_alive_pending_bytes)[index] = 0;
+    noteKeepAliveLatency(ctx, index, latency_ms, now_ms);
+}
+
+const slow_keep_alive_ms: u64 = 16;
+
+fn noteKeepAliveLatency(ctx: *LoopContext, index: usize, latency_ms: u64, now_ms: u64) void {
+    if (comptime !tui.enabled) return;
+    if (ctx.dashboard_shard == null) return;
+    ctx.keep_alive_histogram.record(latency_ms);
+    // Every reply would drown the log; only the ones worth reading are events.
+    if (latency_ms < slow_keep_alive_ms) return;
+    recordEvent(ctx, now_ms, .{
+        .kind = .keepalive,
+        .client = ctx.clients.global_indices.items[index],
+        .value = latency_ms,
+    });
 }
 
 fn clearKeepAlivePending(clients: *ClientTable, index: usize) void {
@@ -1078,8 +1340,27 @@ fn handleSignal(_: posix.SIG) callconv(.c) void {
     // (e.g. a pathological reconnect storm); force an immediate exit so the
     // user is never stuck. 128 + SIGINT(2) is the conventional exit code.
     if (stop_signal_count.fetchAdd(1, .monotonic) >= 1) {
+        // Leaving the alternate screen and raw mode behind would hand the user
+        // back an unusable terminal.
+        tui.emergencyRestore();
         std.process.exit(130);
     }
+}
+
+// Signals that kill the process outright. The dashboard leaves ISIG on so the
+// terminal's own keys keep working, which makes Ctrl-\ a one-keystroke way to
+// exit with raw mode and the alternate screen still in place. Restore the
+// terminal, then let the signal do what it was going to do: this is a quit, not
+// a shutdown, so it must not be swallowed into the graceful path.
+fn handleFatalSignal(sig: posix.SIG) callconv(.c) void {
+    tui.emergencyRestore();
+    const default_action: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.DFL },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(sig, &default_action, null);
+    posix.raise(sig) catch {};
 }
 
 fn installSignalHandlers() void {
@@ -1090,6 +1371,15 @@ fn installSignalHandlers() void {
     };
     posix.sigaction(.INT, &action, null);
     posix.sigaction(.TERM, &action, null);
+
+    // Not SIGHUP: the terminal is already gone by then, so the restore writes
+    // would only fail with EIO.
+    const fatal: posix.Sigaction = .{
+        .handler = .{ .handler = handleFatalSignal },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(.QUIT, &fatal, null);
 }
 
 test "jitteredDelay stays within the equal-jitter window" {

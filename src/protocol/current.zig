@@ -22,6 +22,9 @@ pub fn writeKnownPacks(packet: anytype, include_core: bool) @TypeOf(packet.*).Er
 }
 pub const writeChatMessage = version.writeChatMessage;
 pub const writeChunkBatchReceived = version.writeChunkBatchReceived;
+/// When set, `writeAcceptTeleportation` takes the client's resolved absolute
+/// position and rotation after the teleport id.
+pub const accept_teleportation_includes_pose = version.accept_teleportation_includes_pose;
 pub const writeAcceptTeleportation = version.writeAcceptTeleportation;
 pub const writeMovementStatusOnly = version.writeMovementStatusOnly;
 pub const writeMovementRotation = if (features.movement) version.writeMovementRotation else {};

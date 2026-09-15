@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) void {
     const enable_client_tick = b.option(bool, "enable-client-tick", "Compile 50 ms client-tick traffic support") orelse !minimal;
     const enable_diagnostics = b.option(bool, "enable-diagnostics", "Compile detailed progress and per-client diagnostics") orelse !minimal;
     const enable_reconnect = b.option(bool, "enable-reconnect", "Compile automatic client reconnect on disconnect") orelse !minimal;
+    const enable_tui = b.option(bool, "enable-tui", "Compile the full-screen terminal dashboard") orelse !minimal;
     const requested_minecraft_version = b.option([]const u8, "minecraft-version", "Minecraft Java version to target, or latest") orelse "latest";
     const minecraft_version = if (std.mem.eql(u8, requested_minecraft_version, "latest")) minecraft_versions.latest.minecraft_version else requested_minecraft_version;
     const minecraft_release = findMinecraftRelease(minecraft_version) orelse @panic("unsupported -Dminecraft-version");
@@ -28,6 +29,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_client_tick", enable_client_tick);
     build_options.addOption(bool, "enable_diagnostics", enable_diagnostics);
     build_options.addOption(bool, "enable_reconnect", enable_reconnect);
+    build_options.addOption(bool, "enable_tui", enable_tui);
     build_options.addOption([]const u8, "minecraft_version", minecraft_version);
     build_options.addOption(i32, "minecraft_protocol_version", minecraft_release.protocol_version);
 
@@ -46,7 +48,7 @@ pub fn build(b: *std.Build) void {
     });
     addZionImports(exe.root_module, build_options, minecraft_version_module);
 
-    exe.lto = if (optimize != .Debug) .full else .none;
+    exe.lto = if (optimize != .debug) .full else .none;
 
     b.installArtifact(exe);
 
@@ -82,7 +84,7 @@ pub fn build(b: *std.Build) void {
     const fuzz_step = b.step("fuzz", "Run builtin fuzz targets (pass --fuzz or --fuzz=<iterations>)");
     fuzz_step.dependOn(&run_exe_tests.step);
 
-    const benchmark_optimize = b.option(std.builtin.OptimizeMode, "benchmark-optimize", "Benchmark optimization mode") orelse .ReleaseFast;
+    const benchmark_optimize = b.option(std.builtin.OptimizeMode, "benchmark-optimize", "Benchmark optimization mode") orelse .fast;
 
     const bench_exe = b.addExecutable(.{
         .name = "zion-bench",
@@ -93,7 +95,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     addZionImports(bench_exe.root_module, build_options, minecraft_version_module);
-    bench_exe.lto = if (benchmark_optimize != .Debug) .full else .none;
+    bench_exe.lto = if (benchmark_optimize != .debug) .full else .none;
     const bench_run = b.addRunArtifact(bench_exe);
     bench_run.stdio = .inherit;
     bench_run.addPassthruArgs();

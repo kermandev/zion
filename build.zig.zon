@@ -1,8 +1,8 @@
 .{
     .name = .zion,
-    .version = "1.1.0",
+    .version = "1.2.0",
     .fingerprint = 0x2aaf547c5c6c9b21,
-    .minimum_zig_version = "0.17.0-dev.1415+64dfaa568",
+    .minimum_zig_version = "0.17.0-dev.1569+5f74e4f3f",
     .dependencies = .{},
     .paths = .{
         "build.zig",

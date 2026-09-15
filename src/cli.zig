@@ -20,6 +20,7 @@ pub const RunOptions = struct {
     client_tick: if (features.client_tick) bool else void = if (features.client_tick) false else {},
     progress_detail: if (features.diagnostics) bool else void = if (features.diagnostics) false else {},
     movement: if (features.movement) client.MovementConfig else void = if (features.movement) .{} else {},
+    tui: if (features.tui) bool else void = if (features.tui) true else {},
 };
 
 pub const Action = union(enum) {
@@ -43,6 +44,7 @@ const RawOptions = struct {
     client_tick: if (features.client_tick) bool else void = if (features.client_tick) false else {},
     progress_detail: if (features.diagnostics) bool else void = if (features.diagnostics) false else {},
     movement: if (features.movement) client.MovementConfig else void = if (features.movement) .{} else {},
+    no_tui: if (features.tui) bool else void = if (features.tui) false else {},
     help: bool = false,
     version: bool = false,
 };
@@ -61,6 +63,7 @@ const Flag = enum {
     @"--broadcast",
     @"--client-tick",
     @"--progress-detail",
+    @"--no-tui",
     @"--movement",
     @"--movement-ms",
     @"--movement-radius",
@@ -119,6 +122,10 @@ pub fn parse(args: *std.process.Args.Iterator) !Action {
             .@"--progress-detail" => {
                 if (comptime !features.diagnostics) return error.FeatureDisabled;
                 raw.progress_detail = true;
+            },
+            .@"--no-tui" => {
+                if (comptime !features.tui) return error.FeatureDisabled;
+                raw.no_tui = true;
             },
             .@"--movement" => {
                 if (comptime !features.movement) return error.FeatureDisabled;
@@ -192,6 +199,7 @@ pub fn parse(args: *std.process.Args.Iterator) !Action {
         .client_tick = if (comptime features.client_tick) raw.client_tick else {},
         .progress_detail = if (comptime features.diagnostics) raw.progress_detail else {},
         .movement = if (comptime features.movement) raw.movement else {},
+        .tui = if (comptime features.tui) !raw.no_tui else {},
     } };
 }
 

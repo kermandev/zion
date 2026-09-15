@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 
 pub const stats_enabled = build_options.enable_stats;
 pub const diagnostics_enabled = build_options.enable_diagnostics;
+pub const tui_enabled = build_options.enable_tui;
 
 // `T` in diagnostics builds, `void` otherwise: the SoA column stays declared but
 // occupies no storage when diagnostics are compiled out.
@@ -10,11 +11,24 @@ pub fn Column(comptime T: type) type {
     return if (diagnostics_enabled) T else void;
 }
 
+// Columns only the dashboard reads. Gated on the dashboard as well as on
+// diagnostics so a headless diagnostics build keeps its per-client footprint.
+pub const dashboard_columns_enabled = diagnostics_enabled and tui_enabled;
+
+pub fn DashboardColumn(comptime T: type) type {
+    return if (dashboard_columns_enabled) T else void;
+}
+
 pub const StatsColumns = struct {
     last_packet_id: Column(i32) = if (diagnostics_enabled) -1 else {},
     keep_alives_answered: Column(u32) = if (diagnostics_enabled) 0 else {},
     keep_alive_started_ms: Column(u64) = if (diagnostics_enabled) 0 else {},
     keep_alive_pending_bytes: Column(u16) = if (diagnostics_enabled) 0 else {},
+    // When this client last dropped, as milliseconds since the shard started,
+    // so re-entering play can be reported as a rejoin time. Zero means it has
+    // not dropped yet. 32 bits covers 49 days of run time and halves what this
+    // cold column costs per client.
+    disconnected_at_ms: DashboardColumn(u32) = if (dashboard_columns_enabled) 0 else {},
 };
 
 pub const Disconnects = struct {
@@ -80,6 +94,12 @@ pub const Diagnostics = struct {
     keep_alive_send_samples: u64 = 0,
     keep_alive_send_total_ms: u64 = 0,
     keep_alive_send_max_ms: u64 = 0,
+    // Whether the receive ring registered with IOU_PBUF_RING_INC, which decides
+    // whether a completion retires a whole buffer or only the bytes it used.
+    // Every shard registers against the same kernel and so gets the same
+    // answer; merging with `or` keeps that answer through an aggregate that
+    // starts out zeroed.
+    incremental_buffers: bool = false,
     disconnects: Disconnects = .{},
 
     pub fn add(self: *Diagnostics, other: Diagnostics) void {
@@ -92,6 +112,7 @@ pub const Diagnostics = struct {
         self.keep_alive_send_samples += other.keep_alive_send_samples;
         self.keep_alive_send_total_ms += other.keep_alive_send_total_ms;
         self.keep_alive_send_max_ms = @max(self.keep_alive_send_max_ms, other.keep_alive_send_max_ms);
+        self.incremental_buffers = self.incremental_buffers or other.incremental_buffers;
         self.disconnects.add(other.disconnects);
     }
 
@@ -167,6 +188,7 @@ test "diagnostics aggregate pressure and retain peak CQ utilization" {
         .keep_alive_send_samples = 2,
         .keep_alive_send_total_ms = 13,
         .keep_alive_send_max_ms = 9,
+        .incremental_buffers = true,
         .disconnects = .{ .server = 2 },
     });
 
@@ -177,6 +199,9 @@ test "diagnostics aggregate pressure and retain peak CQ utilization" {
     try std.testing.expectEqual(@as(u32, 256), diagnostics.max_cq_entries);
     try std.testing.expectEqual(@as(u64, 16_384), diagnostics.max_recv_bundle_bytes);
     try std.testing.expectEqual(@as(u32, 4), diagnostics.max_recv_bundle_buffers);
+    // The run's buffer mode has to survive a merge whose left side is the
+    // zeroed aggregate every shard is added into.
+    try std.testing.expect(diagnostics.incremental_buffers);
     try std.testing.expectEqual(@as(u64, 3), diagnostics.keep_alive_send_samples);
     try std.testing.expectEqual(@as(u64, 18), diagnostics.keep_alive_send_total_ms);
     try std.testing.expectEqual(@as(u64, 9), diagnostics.keep_alive_send_max_ms);

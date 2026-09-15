@@ -71,7 +71,7 @@ pub fn packCompletionKey(key: CompletionKey) u64 {
     return @bitCast(PackedKey{
         .index = @intCast(key.index),
         .generation = key.generation,
-        .kind = @intFromEnum(key.kind),
+        .kind = @backingInt(key.kind),
     });
 }
 
@@ -146,35 +146,96 @@ pub fn recvLayout(ring: *const IoUring, client_count: usize) RecvLayout {
 
 pub const RecvSlice = struct {
     buffer_id: u16,
+    /// Byte offset the data starts at inside the buffer. Always 0 without
+    /// incremental consumption, where a completion always starts a fresh buffer.
+    offset: u32 = 0,
     len: usize,
+};
+
+/// A slice paired with whether its buffer may go back to the kernel. Under
+/// incremental consumption the kernel keeps the last, partially filled buffer
+/// of a completion and resumes writing into it, so handing it back would
+/// provide the same buffer twice.
+pub const RecvRelease = struct {
+    slice: RecvSlice,
+    recycle: bool,
 };
 
 pub const RecvBatch = struct {
     next_id: u16,
+    next_offset: u32,
     remaining: usize,
     buffer_size: u32,
     buffer_count: u16,
+    /// IORING_CQE_F_BUF_MORE: the kernel is not done with the batch's last
+    /// buffer. Only ever set under incremental consumption.
+    retain_last: bool,
 
     pub fn init(start_id: u16, total_len: usize, buffer_size: u32, buffer_count: u16) error{InvalidBatch}!RecvBatch {
+        return initAt(start_id, 0, total_len, buffer_size, buffer_count, false);
+    }
+
+    /// `start_offset` is how far into `start_id` this completion's data begins,
+    /// which only incremental consumption can make non-zero; `retain_last`
+    /// is the completion's IORING_CQE_F_BUF_MORE bit.
+    pub fn initAt(
+        start_id: u16,
+        start_offset: u32,
+        total_len: usize,
+        buffer_size: u32,
+        buffer_count: u16,
+        retain_last: bool,
+    ) error{InvalidBatch}!RecvBatch {
         // Power-of-two counts (guaranteed by boundedPowerOfTwo) let next() wrap
         // with a mask; a runtime `%` would emit a hardware divide per slice.
         if (buffer_size == 0 or !std.math.isPowerOfTwo(buffer_count) or start_id >= buffer_count or total_len == 0) return error.InvalidBatch;
-        if (total_len > @as(usize, buffer_size) * buffer_count) return error.InvalidBatch;
+        if (start_offset >= buffer_size) return error.InvalidBatch;
+        // The first buffer only contributes what the kernel has not already
+        // consumed from it, so the batch can hold that much less.
+        if (total_len > @as(usize, buffer_size) * buffer_count - start_offset) return error.InvalidBatch;
         return .{
             .next_id = start_id,
+            .next_offset = start_offset,
             .remaining = total_len,
             .buffer_size = buffer_size,
             .buffer_count = buffer_count,
+            .retain_last = retain_last,
         };
     }
 
     pub fn next(self: *RecvBatch) ?RecvSlice {
         if (self.remaining == 0) return null;
-        const len = @min(self.remaining, self.buffer_size);
-        const result: RecvSlice = .{ .buffer_id = self.next_id, .len = len };
+        const offset = self.next_offset;
+        const len = @min(self.remaining, self.buffer_size - offset);
+        const result: RecvSlice = .{ .buffer_id = self.next_id, .offset = offset, .len = len };
         self.remaining -= len;
+        // Only the buffer the kernel stopped in can start part-way through; the
+        // rest of a bundled completion lands in buffers it took whole.
+        self.next_offset = 0;
         self.next_id = (self.next_id + 1) & (self.buffer_count - 1);
         return result;
+    }
+
+    /// How many buffers this batch's slices span.
+    ///
+    /// Not `total_len` rounded up to a buffer: a batch that starts part-way
+    /// into one covers only what is left of it, so the offset the kernel
+    /// already consumed counts toward the span as well. Without incremental
+    /// consumption that offset is always zero and this is the plain rounding
+    /// it has always been. Call before consuming the batch.
+    pub fn bufferSpan(self: RecvBatch) u32 {
+        // buffer_size is a power of two (boundedPowerOfTwo), so this is a shift
+        // rather than a hardware divide.
+        const size: u64 = self.buffer_size;
+        const spanned: u64 = self.remaining + self.next_offset;
+        return @intCast((spanned + size - 1) >> @intCast(@ctz(size)));
+    }
+
+    /// Iterates like `next`, tagging each slice with whether its buffer is the
+    /// caller's to give back.
+    pub fn nextRelease(self: *RecvBatch) ?RecvRelease {
+        const slice = self.next() orelse return null;
+        return .{ .slice = slice, .recycle = !(self.remaining == 0 and self.retain_last) };
     }
 };
 
@@ -182,35 +243,50 @@ pub const RecvBufferGroup = struct {
     ring: *IoUring,
     br: *align(std.heap.page_size_min) linux.io_uring_buf_ring,
     buffers: []u8,
+    /// How far the kernel has written into each buffer, mirroring the offset it
+    /// keeps in the ring entry itself. Empty unless `incremental` is set: only
+    /// then can a completion start part-way into a buffer, and the CQE carries
+    /// the buffer id but never the offset, so userspace has to track it.
+    heads: []u32,
     buffer_size: u32,
     buffer_count: u16,
     group_id: u16,
     bundled: bool,
+    /// Whether the ring registered with IOU_PBUF_RING_INC. Decided once per
+    /// group at registration, so a run never mixes the two release rules.
+    incremental: bool,
 
     pub fn init(ring: *IoUring, allocator: std.mem.Allocator, group_id: u16, layout: RecvLayout) !RecvBufferGroup {
         const buffers = try allocator.alloc(u8, @as(usize, layout.buffer_size) * layout.buffer_count);
         errdefer allocator.free(buffers);
-        const br = try IoUring.setup_buf_ring(ring.fd, layout.buffer_count, group_id, .{ .inc = false });
-        IoUring.buf_ring_init(br);
+        const registration = try registerRecvBufRing(ring.fd, layout.buffer_count, group_id);
+        errdefer IoUring.free_buf_ring(ring.fd, registration.br, layout.buffer_count, group_id);
+        const heads: []u32 = if (registration.incremental) try allocator.alloc(u32, layout.buffer_count) else &.{};
+        errdefer allocator.free(heads);
+        @memset(heads, 0);
+        IoUring.buf_ring_init(registration.br);
         const group: RecvBufferGroup = .{
             .ring = ring,
-            .br = br,
+            .br = registration.br,
             .buffers = buffers,
+            .heads = heads,
             .buffer_size = layout.buffer_size,
             .buffer_count = layout.buffer_count,
             .group_id = group_id,
             .bundled = layout.bundled,
+            .incremental = registration.incremental,
         };
         const mask = IoUring.buf_ring_mask(layout.buffer_count);
         for (0..layout.buffer_count) |id| {
-            IoUring.buf_ring_add(br, group.bufferAt(@intCast(id)), @intCast(id), mask, @intCast(id));
+            IoUring.buf_ring_add(registration.br, group.bufferAt(@intCast(id)), @intCast(id), mask, @intCast(id));
         }
-        IoUring.buf_ring_advance(br, layout.buffer_count);
+        IoUring.buf_ring_advance(registration.br, layout.buffer_count);
         return group;
     }
 
     pub fn deinit(self: *RecvBufferGroup, allocator: std.mem.Allocator) void {
         IoUring.free_buf_ring(self.ring.fd, self.br, self.buffer_count, self.group_id);
+        allocator.free(self.heads);
         allocator.free(self.buffers);
         self.* = undefined;
     }
@@ -227,7 +303,18 @@ pub const RecvBufferGroup = struct {
     }
 
     pub fn batch(self: *const RecvBufferGroup, event: linux.io_uring_cqe) !RecvBatch {
-        return RecvBatch.init(try event.buffer_id(), @intCast(event.res), self.buffer_size, self.buffer_count);
+        const start_id = try event.buffer_id();
+        if (!self.incremental) return RecvBatch.init(start_id, @intCast(event.res), self.buffer_size, self.buffer_count);
+        // buffer_id() is a raw 16-bit field, so bound it before it indexes heads.
+        if (start_id >= self.buffer_count) return error.InvalidBatch;
+        return RecvBatch.initAt(
+            start_id,
+            self.heads[start_id],
+            @intCast(event.res),
+            self.buffer_size,
+            self.buffer_count,
+            (event.flags & linux.IORING_CQE_F_BUF_MORE) != 0,
+        );
     }
 
     fn bufferAt(self: *const RecvBufferGroup, buffer_id: u16) []u8 {
@@ -236,20 +323,91 @@ pub const RecvBufferGroup = struct {
     }
 
     pub fn bytes(self: *const RecvBufferGroup, slice: RecvSlice) []u8 {
-        return self.bufferAt(slice.buffer_id)[0..slice.len];
+        return self.bufferAt(slice.buffer_id)[slice.offset..][0..slice.len];
     }
 
-    pub fn releaseBatch(self: *const RecvBufferGroup, batch_value: RecvBatch) void {
+    /// Hands a completion's buffers back to the kernel.
+    ///
+    /// Takes a mutable group rather than joining the `*const` readers beside
+    /// it: under incremental consumption this carries the release protocol's
+    /// state, recording in `heads` how much of a retained buffer is spoken for.
+    /// Must be called in completion order, before the next batch for the same
+    /// buffer is built.
+    pub fn releaseBatch(self: *RecvBufferGroup, batch_value: RecvBatch) void {
         var iterator = batch_value;
         const mask = IoUring.buf_ring_mask(self.buffer_count);
         var released: u16 = 0;
-        while (iterator.next()) |slice| {
+        // Without incremental consumption `recycle` is always true and this is
+        // the plain re-add loop it has always been.
+        while (iterator.nextRelease()) |step| {
+            const slice = step.slice;
+            if (!step.recycle) {
+                // The kernel still owns this buffer and will keep filling it
+                // from where it stopped; re-adding it now would provide it
+                // twice. Remember how much of it is spoken for instead.
+                self.heads[slice.buffer_id] = slice.offset + @as(u32, @intCast(slice.len));
+                break;
+            }
+            if (self.incremental) self.heads[slice.buffer_id] = 0;
             IoUring.buf_ring_add(self.br, self.bufferAt(slice.buffer_id), slice.buffer_id, mask, released);
             released += 1;
         }
         if (released > 0) IoUring.buf_ring_advance(self.br, released);
     }
 };
+
+const BufRingRegistration = struct {
+    br: *align(std.heap.page_size_min) linux.io_uring_buf_ring,
+    incremental: bool,
+};
+
+/// Registers the provided-buffer ring, preferring incremental consumption
+/// (IOU_PBUF_RING_INC, kernel 6.12+) and reporting which mode was granted.
+///
+/// `IoUring.setup_buf_ring` cannot be used for this: it retries with `.inc` off
+/// when the kernel rejects the flag and returns no way to tell the two apart,
+/// and guessing wrong means recycling buffers the kernel still owns.
+fn registerRecvBufRing(fd: linux.fd_t, entries: u16, group_id: u16) !BufRingRegistration {
+    if (entries == 0 or entries > 1 << 15) return error.EntriesNotInRange;
+    if (!std.math.isPowerOfTwo(entries)) return error.EntriesNotPowerOfTwo;
+    const mmap = try posix.mmap(
+        null,
+        @as(usize, entries) * @sizeOf(linux.io_uring_buf),
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+    errdefer posix.munmap(mmap);
+    const br: *align(std.heap.page_size_min) linux.io_uring_buf_ring = @ptrCast(mmap.ptr);
+    if (registerBufRing(fd, @intFromPtr(br), entries, group_id, .{ .inc = true })) {
+        return .{ .br = br, .incremental = true };
+    } else |err| switch (err) {
+        // Pre-6.12 kernels reject the unknown flag bit outright. Nothing was
+        // registered, so the same mapping can be offered again unchanged.
+        error.ArgumentsInvalid => {},
+        else => return err,
+    }
+    try registerBufRing(fd, @intFromPtr(br), entries, group_id, .{ .inc = false });
+    return .{ .br = br, .incremental = false };
+}
+
+fn registerBufRing(fd: linux.fd_t, addr: u64, entries: u32, group_id: u16, flags: linux.io_uring_buf_reg.Flags) !void {
+    var reg = std.mem.zeroInit(linux.io_uring_buf_reg, .{
+        .ring_addr = addr,
+        .ring_entries = entries,
+        .bgid = group_id,
+        .flags = flags,
+    });
+    const res = linux.io_uring_register(fd, .REGISTER_PBUF_RING, @as(*const anyopaque, @ptrCast(&reg)), 1);
+    return switch (linux.errno(res)) {
+        .SUCCESS => {},
+        .INVAL => error.ArgumentsInvalid,
+        .NOMEM => error.SystemResources,
+        .EXIST => error.BufferGroupExists,
+        else => |errno| posix.unexpectedErrno(errno),
+    };
+}
 
 pub fn timeoutTimespec(timeout_ms: i32) linux.kernel_timespec {
     const ms: i64 = @intCast(@max(timeout_ms, 0));
@@ -484,6 +642,95 @@ test "receive batches wrap buffer ids and validate capacity" {
 
     try std.testing.expectError(error.InvalidBatch, RecvBatch.init(0, 1, 0, 4));
     try std.testing.expectError(error.InvalidBatch, RecvBatch.init(0, 8193, 2048, 4));
+}
+
+test "incremental batches start where the kernel stopped writing" {
+    var batch = try RecvBatch.initAt(2, 3000, 2000, 4096, 8, false);
+    try std.testing.expectEqual(RecvSlice{ .buffer_id = 2, .offset = 3000, .len = 1096 }, batch.next().?);
+    try std.testing.expectEqual(RecvSlice{ .buffer_id = 3, .offset = 0, .len = 904 }, batch.next().?);
+    try std.testing.expectEqual(@as(?RecvSlice, null), batch.next());
+
+    // Two completions out of one buffer must cover disjoint ranges.
+    var first = try RecvBatch.initAt(5, 0, 60, 4096, 8, true);
+    const first_slice = first.next().?;
+    var second = try RecvBatch.initAt(5, first_slice.offset + @as(u32, @intCast(first_slice.len)), 40, 4096, 8, true);
+    const second_slice = second.next().?;
+    try std.testing.expectEqual(RecvSlice{ .buffer_id = 5, .offset = 0, .len = 60 }, first_slice);
+    try std.testing.expectEqual(RecvSlice{ .buffer_id = 5, .offset = 60, .len = 40 }, second_slice);
+
+    try std.testing.expectError(error.InvalidBatch, RecvBatch.initAt(0, 4096, 1, 4096, 8, false));
+    // 4096 * 8 bytes of ring minus the 100 already consumed from the first.
+    try std.testing.expectError(error.InvalidBatch, RecvBatch.initAt(0, 100, 32669, 4096, 8, false));
+    try std.testing.expectError(error.InvalidBatch, RecvBatch.initAt(8, 0, 1, 4096, 8, true));
+    try std.testing.expectError(error.InvalidBatch, RecvBatch.initAt(0, 0, 0, 4096, 8, true));
+}
+
+test "a batch's buffer span counts the buffers it actually slices" {
+    // The span is what the diagnostics counter reports, so it has to agree with
+    // the iteration rather than approximate it.
+    const cases = [_]struct { start: u16, offset: u32, len: usize }{
+        .{ .start = 2, .offset = 0, .len = 9000 },
+        .{ .start = 0, .offset = 0, .len = 4096 },
+        .{ .start = 0, .offset = 0, .len = 1 },
+        // A mid-buffer start spans a buffer more than rounding the byte count
+        // up would suggest: 500 bytes rounds to one, but 96 of them land in the
+        // tail of the first buffer and 404 in the next.
+        .{ .start = 2, .offset = 4000, .len = 500 },
+        .{ .start = 0, .offset = 4095, .len = 1 },
+        .{ .start = 0, .offset = 4095, .len = 2 },
+        .{ .start = 7, .offset = 100, .len = 12_000 },
+    };
+    for (cases) |case| {
+        var batch = try RecvBatch.initAt(case.start, case.offset, case.len, 4096, 8, false);
+        const span = batch.bufferSpan();
+        var sliced: u32 = 0;
+        while (batch.next()) |_| sliced += 1;
+        try std.testing.expectEqual(sliced, span);
+    }
+
+    // The case the byte count alone gets wrong.
+    var undercounted = try RecvBatch.initAt(2, 4000, 500, 4096, 8, false);
+    try std.testing.expectEqual(@as(u32, 2), undercounted.bufferSpan());
+}
+
+test "batches only recycle buffers the kernel is done with" {
+    // Classic consumption hands every buffer back, as it always has.
+    var classic = try RecvBatch.init(6, 5000, 4096, 8);
+    while (classic.nextRelease()) |step| try std.testing.expect(step.recycle);
+
+    // IORING_CQE_F_BUF_MORE: the kernel keeps the buffer it stopped in, and
+    // only that one. Whole buffers ahead of it are still ours to return.
+    var retained = try RecvBatch.initAt(6, 96, 5000, 4096, 8, true);
+    const whole = retained.nextRelease().?;
+    try std.testing.expectEqual(RecvSlice{ .buffer_id = 6, .offset = 96, .len = 4000 }, whole.slice);
+    try std.testing.expect(whole.recycle);
+    const partial = retained.nextRelease().?;
+    try std.testing.expectEqual(RecvSlice{ .buffer_id = 7, .offset = 0, .len = 1000 }, partial.slice);
+    try std.testing.expect(!partial.recycle);
+    try std.testing.expectEqual(@as(?RecvRelease, null), retained.nextRelease());
+
+    // Without the flag the same completion returns both.
+    var finished = try RecvBatch.initAt(6, 96, 5000, 4096, 8, false);
+    while (finished.nextRelease()) |step| try std.testing.expect(step.recycle);
+}
+
+test "receive slices address the unconsumed tail of their buffer" {
+    var storage: [32]u8 = undefined;
+    for (&storage, 0..) |*byte, index| byte.* = @intCast(index);
+    var heads: [4]u32 = @splat(0);
+    const group: RecvBufferGroup = .{
+        .ring = undefined,
+        .br = undefined,
+        .buffers = &storage,
+        .heads = &heads,
+        .buffer_size = 8,
+        .buffer_count = 4,
+        .group_id = 0,
+        .bundled = true,
+        .incremental = true,
+    };
+    try std.testing.expectEqualSlices(u8, storage[19..22], group.bytes(.{ .buffer_id = 2, .offset = 3, .len = 3 }));
+    try std.testing.expectEqualSlices(u8, storage[8..12], group.bytes(.{ .buffer_id = 1, .len = 4 }));
 }
 
 test "recvBufferCount scales shared buffer rings by shard size" {

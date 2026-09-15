@@ -6,6 +6,8 @@ pub const Release = struct {
 
 const v26_1_implementation = "26_1";
 const v26_3_snapshot_3_implementation = "26_3_snapshot_3";
+const v26_3_snapshot_10_implementation = "26_3_snapshot_10";
+const v26_3_pre_3_implementation = "26_3_pre_3";
 
 /// Snapshot/pre-release/RC builds set bit 30 of the protocol version and
 /// count a separate snapshot ordinal in the low bits (e.g. `snapshot_bit | 304`
@@ -48,4 +50,16 @@ pub const all = [_]Release{
     .{ .minecraft_version = "26.3-snapshot-2", .protocol_version = snapshot_bit | 324, .implementation_file = v26_1_implementation },
     .{ .minecraft_version = "26.3-snapshot-3", .protocol_version = snapshot_bit | 325, .implementation_file = v26_3_snapshot_3_implementation },
     .{ .minecraft_version = "26.3-snapshot-4", .protocol_version = snapshot_bit | 326, .implementation_file = v26_3_snapshot_3_implementation },
+    .{ .minecraft_version = "26.3-snapshot-5", .protocol_version = snapshot_bit | 327, .implementation_file = v26_3_snapshot_3_implementation },
+    .{ .minecraft_version = "26.3-snapshot-6", .protocol_version = snapshot_bit | 328, .implementation_file = v26_3_snapshot_3_implementation },
+    .{ .minecraft_version = "26.3-snapshot-7", .protocol_version = snapshot_bit | 329, .implementation_file = v26_3_snapshot_3_implementation },
+    .{ .minecraft_version = "26.3-snapshot-8", .protocol_version = snapshot_bit | 330, .implementation_file = v26_3_snapshot_3_implementation },
+    .{ .minecraft_version = "26.3-snapshot-9", .protocol_version = snapshot_bit | 331, .implementation_file = v26_3_snapshot_3_implementation },
+    .{ .minecraft_version = "26.3-snapshot-10", .protocol_version = snapshot_bit | 332, .implementation_file = v26_3_snapshot_10_implementation },
+    .{ .minecraft_version = "26.3-pre-1", .protocol_version = snapshot_bit | 333, .implementation_file = v26_3_snapshot_10_implementation },
+    .{ .minecraft_version = "26.3-pre-2", .protocol_version = snapshot_bit | 334, .implementation_file = v26_3_snapshot_10_implementation },
+    .{ .minecraft_version = "26.3-pre-3", .protocol_version = snapshot_bit | 335, .implementation_file = v26_3_pre_3_implementation },
+    .{ .minecraft_version = "26.3-rc-1", .protocol_version = snapshot_bit | 336, .implementation_file = v26_3_pre_3_implementation },
+    .{ .minecraft_version = "26.3-rc-2", .protocol_version = snapshot_bit | 337, .implementation_file = v26_3_pre_3_implementation },
+    .{ .minecraft_version = "26.3-rc-3", .protocol_version = snapshot_bit | 338, .implementation_file = v26_3_pre_3_implementation },
 };

@@ -1,11 +1,25 @@
 const std = @import("std");
 const Io = std.Io;
+const build_options = @import("build_options");
 const features = @import("features.zig");
 const cli = @import("cli.zig");
 const client = @import("client.zig");
 const endpoint = @import("endpoint.zig");
 const pool = @import("pool.zig");
 const report = @import("report.zig");
+const tui = @import("tui.zig");
+
+pub const panic = std.debug.FullPanic(zionPanic);
+
+/// A panic does not unwind, so `Term.deinit` and the `errdefer` that back the
+/// dashboard's restore never run: without this a bug in the render path leaves
+/// raw mode and the alternate screen behind. Restoring first also moves the
+/// trace onto the real screen, which the alternate one would otherwise discard
+/// along with the message that explains the crash.
+fn zionPanic(message: []const u8, first_trace_address: ?usize) noreturn {
+    tui.emergencyRestore();
+    std.debug.defaultPanic(message, first_trace_address);
+}
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -51,13 +65,43 @@ fn runLoad(
     const client_tick_packet = if (comptime features.client_tick) if (options.client_tick) try client.buildClientTickPacket(arena) else null else {};
 
     const shard_count = pool.shardCount(options.shards, options.clients);
+    const dashboard_wanted = if (comptime features.tui) tui.shouldRun(io, options.tui) else false;
+
     var join_progress: pool.JoinProgress = .{
         .io = io,
         .total = options.clients,
         .tty = Io.File.stdout().isTty(io) catch false,
         .detail = if (comptime features.diagnostics) options.progress_detail else false,
+        // The dashboard owns the screen; the single-line progress output would
+        // fight it for stdout.
+        .enabled = !dashboard_wanted,
     };
     errdefer join_progress.end();
+
+    var dashboard: if (features.tui) tui.Dashboard else void = if (comptime features.tui) .{
+        .info = .{
+            .target = try renderTarget(arena, options.target),
+            .minecraft_version = client.protocol.current.minecraft_version,
+            .protocol_version = client.protocol.current.protocol_version,
+            .client_count = options.clients,
+            .connect_rate_per_sec = options.connect_rate_per_sec,
+            .username_prefix = options.username_prefix,
+            .movement = if (comptime features.movement) @tagName(options.movement.profile) else "",
+            // The run header scrolls away behind the alternate screen, so the
+            // context line is the only place these show while the dashboard is
+            // up. The broadcast's own message is deliberately left out: it is
+            // user-supplied and arbitrarily long, and the header still has it.
+            .broadcast = if (comptime features.broadcast)
+                (if (broadcast) |value| try std.fmt.allocPrint(arena, "broadcast {d}ms", .{value.interval_ms}) else "")
+            else
+                "",
+            .client_tick = if (comptime features.client_tick)
+                (if (options.client_tick) "tick 50ms" else "")
+            else
+                "",
+            .reconnect = options.reconnect,
+        },
+    } else {};
 
     try report.writeRunHeader(stdout, .{
         .target = options.target,
@@ -81,10 +125,29 @@ fn runLoad(
         .username_prefix = options.username_prefix,
         .known_core_pack = options.known_core_pack,
         .join_progress = &join_progress,
+        .dashboard = if (comptime features.tui) (if (dashboard_wanted) &dashboard else null) else {},
     });
     join_progress.end();
     try stdout.flush();
     try report.writeStatsBlocking(io, stats);
+    // The dashboard's own history dies with the alternate screen, so its peaks
+    // follow the stats block into scrollback.
+    if (comptime features.tui) try writeSummaryBlocking(io, dashboard.summary);
+}
+
+fn renderTarget(arena: std.mem.Allocator, target: endpoint.Target) ![]const u8 {
+    var rendered: Io.Writer.Allocating = .init(arena);
+    try report.writeTarget(&rendered.writer, target);
+    return rendered.written();
+}
+
+fn writeSummaryBlocking(io: Io, summary: tui.Summary) !void {
+    if (comptime !features.tui) return;
+    var buffer: [1024]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    try tui.writeSummary(&writer, summary);
+    if (writer.buffered().len == 0) return;
+    try Io.File.stdout().writeStreamingAll(io, writer.buffered());
 }
 
 // Both exits flush stderr themselves: std.process.exit runs before main's
@@ -116,4 +179,6 @@ test {
     _ = @import("scheduler.zig");
     _ = @import("pool.zig");
     _ = @import("bench.zig");
+    _ = @import("telemetry.zig");
+    _ = @import("tui.zig");
 }

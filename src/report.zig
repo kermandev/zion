@@ -74,6 +74,10 @@ pub fn writeUsage(writer: *Io.Writer) !void {
         \\  --progress-detail           Print detailed join logs instead of progress bar
         \\
     );
+    if (comptime features.tui) try writer.writeAll(
+        \\  --no-tui                    Use the single-line progress output instead of the dashboard
+        \\
+    );
     try writer.writeAll(
         \\  -V, --version               Show version information
         \\  -h, --help                  Show this help message
@@ -109,6 +113,7 @@ const feature_list = list: {
     if (features.client_tick) list = list ++ " client-tick";
     if (features.diagnostics) list = list ++ " diagnostics";
     if (features.reconnect) list = list ++ " reconnect";
+    if (features.tui) list = list ++ " tui";
     break :list if (list.len == 0) " none" else list;
 };
 
@@ -228,7 +233,7 @@ pub fn writeStats(writer: *Io.Writer, stats: client_table.Stats) !void {
                 @as(f64, @floatFromInt(diagnostics.keep_alive_send_samples));
 
         try writeLabel(writer, "diagnostics");
-        try writer.print("recv_nobufs={d} cq_overflow={d} close_failures={d} peak_cq={d}/{d} max_recv_bundle={f}/{d}\n", .{
+        try writer.print("recv_nobufs={d} cq_overflow={d} close_failures={d} peak_cq={d}/{d} max_recv_bundle={f}/{d} recv_buffers={s}\n", .{
             diagnostics.recv_nobufs,
             diagnostics.cq_overflow,
             diagnostics.close_failures,
@@ -236,6 +241,10 @@ pub fn writeStats(writer: *Io.Writer, stats: client_table.Stats) !void {
             diagnostics.max_cq_entries,
             bytes(@floatFromInt(diagnostics.max_recv_bundle_bytes)),
             diagnostics.max_recv_bundle_buffers,
+            // The kernel decides this, not the build: a run that fell back to
+            // retiring whole buffers has a fraction of the ring capacity, which
+            // is otherwise invisible when comparing two runs.
+            if (diagnostics.incremental_buffers) "incremental" else "whole",
         });
 
         try writeLabel(writer, "keepalive");
@@ -247,9 +256,21 @@ pub fn writeStats(writer: *Io.Writer, stats: client_table.Stats) !void {
     }
 }
 
+/// Columns `writeLabel` reserves before every value: two spaces, an
+/// eleven-column name, two more spaces. Exported because the overlay reprints
+/// these lines and has to split them at the same column.
+pub const label_columns: usize = 15;
+
 // Left aligned label column so every value starts at the same offset.
-fn writeLabel(writer: *Io.Writer, name: []const u8) !void {
+pub fn writeLabel(writer: *Io.Writer, name: []const u8) !void {
     try writer.print("  {s:<11}  ", .{name});
+}
+
+/// A per-second rate as a whole number. Guards the conversion: a rate is f64
+/// and `@intFromFloat` has no answer for a negative or a NaN.
+pub fn rounded(value: f64) u64 {
+    if (!(value > 0)) return 0;
+    return @intFromFloat(@round(value));
 }
 
 fn writeDisconnects(writer: *Io.Writer, disconnects: stats_module.Disconnects) !void {
@@ -281,7 +302,7 @@ fn writeDisconnects(writer: *Io.Writer, disconnects: stats_module.Disconnects) !
     if (!any) try writer.writeAll("none");
 }
 
-fn grouped(value: u64) Grouped {
+pub fn grouped(value: u64) Grouped {
     return .{ .value = value };
 }
 
@@ -290,7 +311,7 @@ fn groupedFixed(value: f64) GroupedFixed {
 }
 
 // Thousands separated integer: 1234567 prints as 1,234,567.
-const Grouped = struct {
+pub const Grouped = struct {
     value: u64,
 
     pub fn format(self: Grouped, writer: *Io.Writer) Io.Writer.Error!void {
@@ -320,15 +341,15 @@ fn writeGroupedDigits(writer: *Io.Writer, digits: []const u8) !void {
     }
 }
 
-fn bytes(value: f64) Bytes {
+pub fn bytes(value: f64) Bytes {
     return .{ .value = value };
 }
 
-fn byteRate(value: f64) Bytes {
+pub fn byteRate(value: f64) Bytes {
     return .{ .value = value, .per_second = true };
 }
 
-const Bytes = struct {
+pub const Bytes = struct {
     value: f64,
     per_second: bool = false,
 
@@ -447,6 +468,7 @@ test "writeStats includes client packet and traffic rates" {
             .keep_alive_send_samples = 2,
             .keep_alive_send_total_ms = 7,
             .keep_alive_send_max_ms = 5,
+            .incremental_buffers = true,
             .disconnects = .{ .server = 1, .transport = 2, .other = 1 },
         };
     }
@@ -461,7 +483,7 @@ test "writeStats includes client packet and traffic rates" {
         try std.testing.expect(std.mem.indexOf(u8, output, "disabled at compile time") != null);
     }
     if (comptime stats_module.diagnostics_enabled) {
-        try std.testing.expect(std.mem.indexOf(u8, output, "recv_nobufs=3 cq_overflow=4 close_failures=5 peak_cq=128/512 max_recv_bundle=8.00 KiB/2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "recv_nobufs=3 cq_overflow=4 close_failures=5 peak_cq=128/512 max_recv_bundle=8.00 KiB/2 recv_buffers=incremental") != null);
         try std.testing.expect(std.mem.indexOf(u8, output, "samples=2 avg=3.500ms max=5ms") != null);
         // Only fired categories, most frequent first; the zero ones are dropped.
         try std.testing.expect(std.mem.indexOf(u8, output, "disconnects  transport=2 server=1 other=1") != null);

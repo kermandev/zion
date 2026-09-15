@@ -173,12 +173,27 @@ pub const MotionState = if (features.movement) struct {
     has_target: bool = false,
 } else void;
 
+/// The selected protocol version's teleport acknowledgement echoes the
+/// client's position, so every client keeps its last resolved pose.
+const pose_tracked = protocol.version.accept_teleportation_includes_pose;
+
+/// The client's absolute position and look as last confirmed by a server
+/// teleport.
+pub const Pose = struct {
+    x: f64 = 0,
+    y: f64 = 0,
+    z: f64 = 0,
+    yaw: f32 = 0,
+    pitch: f32 = 0,
+};
+
 pub const SessionColumns = struct {
     read: ReadState = .{},
     write: WriteState = .{},
     timers: TimerState = .{},
     compression: if (protocol.compression_enabled) protocol.Compression else void = if (protocol.compression_enabled) .disabled else {},
     joined_logged: bool = false,
+    pose: if (pose_tracked) Pose else void = if (pose_tracked) .{} else {},
 };
 
 pub const FrameResult = struct {
@@ -241,7 +256,11 @@ test "dense client metadata stays compact" {
     try std.testing.expect(@sizeOf(PoolState) <= 24);
     try std.testing.expect(@sizeOf(ReadState) <= 24);
     try std.testing.expect(@sizeOf(TimerState) <= 24);
-    try std.testing.expect(dense_table_bytes_per_client <= if (diagnostics_enabled) 150 else 140);
+    // The dashboard adds one cold u32 column (`disconnected_at_ms`), touched
+    // only when a client drops or rejoins, never on the hot loop.
+    const budget = (if (diagnostics_enabled) 150 + @as(usize, if (@import("stats.zig").dashboard_columns_enabled) 4 else 0) else 140) +
+        @as(usize, if (pose_tracked) 32 else 0);
+    try std.testing.expect(dense_table_bytes_per_client <= budget);
 }
 
 pub const ClientTable = struct {
@@ -387,6 +406,10 @@ pub inline fn motionState(clients: *ClientTable, index: usize) if (features.move
 pub inline fn joinedLogged(clients: *ClientTable, index: usize) *bool {
     return &clients.sessions.items(.joined_logged)[index];
 }
+pub inline fn poseState(clients: *ClientTable, index: usize) if (pose_tracked) *Pose else void {
+    if (comptime pose_tracked) return &clients.sessions.items(.pose)[index];
+    return {};
+}
 
 pub fn username(clients: *const ClientTable, index: usize, buffer: *[16]u8) error{UsernameTooLong}![]const u8 {
     if (clients.username_override) |override| return override;
@@ -419,6 +442,7 @@ pub fn onConnected(clients: *ClientTable, index: usize, phase: *Phase, now_ms: u
             motionState(clients, index).* = .{ .rng = mixSeed(clients.movement.seed, global_index) };
         }
     }
+    if (comptime pose_tracked) poseState(clients, index).* = .{};
     if (comptime stats_module.diagnostics_enabled) {
         const client_stats = clients.stats.slice();
         client_stats.items(.last_packet_id)[index] = -1;
@@ -637,6 +661,7 @@ pub fn close(clients: *ClientTable, index: usize, phase: *Phase, preserve_inflig
     if (comptime features.movement) {
         if (clients.movement.profile != .idle) motionState(clients, index).* = .{};
     }
+    if (comptime pose_tracked) poseState(clients, index).* = .{};
     joinedLogged(clients, index).* = false;
 }
 
@@ -1041,11 +1066,34 @@ fn handlePlayPacket(clients: *ClientTable, index: usize, phase: *Phase, packet: 
             var payload_reader: Io.Reader = .fixed(packet.payload);
             var packet_reader = protocol.PacketReader.init(&payload_reader);
             const teleport_id = try packet_reader.readVarInt();
-            if (comptime features.movement) {
-                if (clients.movement.profile != .idle) try applyServerPosition(motionState(clients, index), &packet_reader);
-            }
             var builder = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.play.serverbound.accept_teleportation);
-            try protocol.version.writeAcceptTeleportation(&builder.writer, teleport_id);
+            if (comptime pose_tracked) {
+                const incoming = try readServerPosition(&packet_reader);
+                const pose = poseState(clients, index);
+                // A walking client's live position is its movement state; the
+                // pose column only sees teleports, so a relative teleport must
+                // resolve from the movement state or the echo lags the walk.
+                if (comptime features.movement) {
+                    if (clients.movement.profile != .idle) {
+                        const motion = motionState(clients, index);
+                        pose.* = incoming.resolve(motionPose(motion));
+                        applyServerPosition(motion, pose.*);
+                    } else {
+                        pose.* = incoming.resolve(pose.*);
+                    }
+                } else {
+                    pose.* = incoming.resolve(pose.*);
+                }
+                try protocol.version.writeAcceptTeleportation(&builder.writer, teleport_id, pose.x, pose.y, pose.z, pose.yaw, pose.pitch);
+            } else {
+                if (comptime features.movement) {
+                    if (clients.movement.profile != .idle) {
+                        const motion = motionState(clients, index);
+                        applyServerPosition(motion, (try readServerPosition(&packet_reader)).resolve(motionPose(motion)));
+                    }
+                }
+                try protocol.version.writeAcceptTeleportation(&builder.writer, teleport_id);
+            }
             try enqueueBuiltPacket(clients, index, builder.packetData(), write_temp_buf);
         },
         packet_ids.play.clientbound.login => {
@@ -1058,6 +1106,12 @@ fn handlePlayPacket(clients: *ClientTable, index: usize, phase: *Phase, packet: 
             const builder = try protocol.PacketFrame.init(packet_builder_buf, packet_ids.play.serverbound.configuration_acknowledged);
             try enqueueBuiltPacket(clients, index, builder.packetData(), write_temp_buf);
             phase.* = .configuration;
+            // The next play session starts with an absolute teleport, so
+            // nothing from this one may serve as a relative base.
+            if (comptime pose_tracked) poseState(clients, index).* = .{};
+            if (comptime features.movement) {
+                if (clients.movement.profile != .idle) motionState(clients, index).initialized = false;
+            }
         },
         else => {},
     }
@@ -1336,23 +1390,51 @@ const PositionRelative = packed struct(i32) {
     _unused: u27 = 0,
 };
 
-fn applyServerPosition(state: *MotionState, reader: *protocol.PacketReader) protocol.PacketError!void {
-    const incoming_x = try reader.readF64();
-    const incoming_y = try reader.readF64();
-    const incoming_z = try reader.readF64();
+/// The body of one clientbound player position packet after its teleport id.
+const ServerPosition = struct {
+    pose: Pose,
+    relative: PositionRelative,
+
+    /// Resolves the packet against the pose it moves from. Relative fields
+    /// are deltas added to the current value, the rest replace it.
+    fn resolve(incoming: ServerPosition, current: Pose) Pose {
+        const relative = incoming.relative;
+        const target = incoming.pose;
+        return .{
+            .x = if (relative.x) current.x + target.x else target.x,
+            .y = if (relative.y) current.y + target.y else target.y,
+            .z = if (relative.z) current.z + target.z else target.z,
+            .yaw = wrapDegrees(if (relative.yaw) current.yaw + target.yaw else target.yaw),
+            .pitch = std.math.clamp(if (relative.pitch) current.pitch + target.pitch else target.pitch, -90.0, 90.0),
+        };
+    }
+};
+
+fn readServerPosition(reader: *protocol.PacketReader) protocol.PacketError!ServerPosition {
+    const x = try reader.readF64();
+    const y = try reader.readF64();
+    const z = try reader.readF64();
     // Delta movement x/y/z: the load tester has no velocity to update.
     _ = try reader.readF64();
     _ = try reader.readF64();
     _ = try reader.readF64();
-    const incoming_yaw = try reader.readF32();
-    const incoming_pitch = try reader.readF32();
+    const yaw = try reader.readF32();
+    const pitch = try reader.readF32();
     const relative: PositionRelative = @bitCast(try reader.readI32());
+    return .{ .pose = .{ .x = x, .y = y, .z = z, .yaw = yaw, .pitch = pitch }, .relative = relative };
+}
 
-    state.x = if (relative.x) state.x + incoming_x else incoming_x;
-    state.y = if (relative.y) state.y + incoming_y else incoming_y;
-    state.z = if (relative.z) state.z + incoming_z else incoming_z;
-    state.yaw = wrapDegrees(if (relative.yaw) state.yaw + incoming_yaw else incoming_yaw);
-    state.pitch = std.math.clamp(if (relative.pitch) state.pitch + incoming_pitch else incoming_pitch, -90.0, 90.0);
+fn motionPose(state: *const MotionState) Pose {
+    return .{ .x = state.x, .y = state.y, .z = state.z, .yaw = state.yaw, .pitch = state.pitch };
+}
+
+/// Moves the client to a resolved teleport and drops any walk in progress.
+fn applyServerPosition(state: *MotionState, resolved: Pose) void {
+    state.x = resolved.x;
+    state.y = resolved.y;
+    state.z = resolved.z;
+    state.yaw = resolved.yaw;
+    state.pitch = resolved.pitch;
     if (!state.initialized) {
         state.origin_x = state.x;
         state.origin_z = state.z;
@@ -1445,7 +1527,7 @@ test "movement applies absolute and relative server positions" {
     var payload_reader: Io.Reader = .fixed(builder.packetData()[1..]);
     var reader = protocol.PacketReader.init(&payload_reader);
     var state: MotionState = .{};
-    try applyServerPosition(&state, &reader);
+    applyServerPosition(&state, (try readServerPosition(&reader)).resolve(motionPose(&state)));
     try std.testing.expectEqual(@as(f64, 10), state.x);
     try std.testing.expectEqual(@as(f64, 64), state.y);
     try std.testing.expectEqual(@as(f64, -5), state.z);
@@ -1463,11 +1545,167 @@ test "movement applies absolute and relative server positions" {
     try builder.writer.writeI32(@bitCast(PositionRelative{ .x = true, .z = true, .yaw = true, .pitch = true }));
     payload_reader = .fixed(builder.packetData()[1..]);
     reader = protocol.PacketReader.init(&payload_reader);
-    try applyServerPosition(&state, &reader);
+    applyServerPosition(&state, (try readServerPosition(&reader)).resolve(motionPose(&state)));
     try std.testing.expectEqual(@as(f64, 12), state.x);
     try std.testing.expectEqual(@as(f64, -2), state.z);
     try std.testing.expectEqual(@as(f32, 105), state.yaw);
     try std.testing.expectEqual(@as(f32, 5), state.pitch);
+}
+
+test "teleport acknowledgement echoes the resolved pose" {
+    if (comptime !pose_tracked) return error.SkipZigTest;
+
+    var phase: Phase = .disconnected;
+    var test_session = try TestSession.init(std.testing.allocator, .{});
+    defer test_session.deinit();
+    try onConnected(&test_session.clients, 0, &phase, 100, &test_session.packet_builder_buf, &test_session.write_temp_buf);
+    test_session.clearWriteBuffer();
+    phase = .play;
+
+    var buffer: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buffer.deinit();
+    var teleport = try protocol.PacketFrame.init(&buffer, packet_ids.play.clientbound.player_position);
+    try teleport.writer.writeVarInt(5);
+    try teleport.writer.writeF64(10);
+    try teleport.writer.writeF64(64);
+    try teleport.writer.writeF64(-5);
+    try teleport.writer.writeF64(0);
+    try teleport.writer.writeF64(0);
+    try teleport.writer.writeF64(0);
+    try teleport.writer.writeF32(90);
+    try teleport.writer.writeF32(10);
+    try teleport.writer.writeI32(0);
+    _ = try handlePlayPacket(
+        &test_session.clients,
+        0,
+        &phase,
+        .{ .id = packet_ids.play.clientbound.player_position, .payload = teleport.packetData()[1..] },
+        &test_session.packet_builder_buf,
+        &test_session.write_temp_buf,
+    );
+
+    var reply_reader: Io.Reader = .fixed(test_session.writeBufferSlice());
+    var reply = protocol.PacketReader.init(&reply_reader);
+    _ = try reply.readVarInt();
+    try std.testing.expectEqual(packet_ids.play.serverbound.accept_teleportation, try reply.readVarInt());
+    try std.testing.expectEqual(@as(i32, 5), try reply.readVarInt());
+    try std.testing.expectEqual(@as(f64, 10), try reply.readF64());
+    try std.testing.expectEqual(@as(f64, 64), try reply.readF64());
+    try std.testing.expectEqual(@as(f64, -5), try reply.readF64());
+    try std.testing.expectEqual(@as(f32, 90), try reply.readF32());
+    try std.testing.expectEqual(@as(f32, 10), try reply.readF32());
+    try std.testing.expectEqual(0, reply_reader.bufferedLen());
+    test_session.clearWriteBuffer();
+
+    teleport = try protocol.PacketFrame.init(&buffer, packet_ids.play.clientbound.player_position);
+    try teleport.writer.writeVarInt(6);
+    try teleport.writer.writeF64(2);
+    try teleport.writer.writeF64(0);
+    try teleport.writer.writeF64(3);
+    try teleport.writer.writeF64(0);
+    try teleport.writer.writeF64(0);
+    try teleport.writer.writeF64(0);
+    try teleport.writer.writeF32(15);
+    try teleport.writer.writeF32(-5);
+    try teleport.writer.writeI32(@bitCast(PositionRelative{ .x = true, .z = true, .yaw = true, .pitch = true }));
+    _ = try handlePlayPacket(
+        &test_session.clients,
+        0,
+        &phase,
+        .{ .id = packet_ids.play.clientbound.player_position, .payload = teleport.packetData()[1..] },
+        &test_session.packet_builder_buf,
+        &test_session.write_temp_buf,
+    );
+
+    reply_reader = .fixed(test_session.writeBufferSlice());
+    reply = protocol.PacketReader.init(&reply_reader);
+    _ = try reply.readVarInt();
+    _ = try reply.readVarInt();
+    try std.testing.expectEqual(@as(i32, 6), try reply.readVarInt());
+    try std.testing.expectEqual(@as(f64, 12), try reply.readF64());
+    try std.testing.expectEqual(@as(f64, 0), try reply.readF64());
+    try std.testing.expectEqual(@as(f64, -2), try reply.readF64());
+    try std.testing.expectEqual(@as(f32, 105), try reply.readF32());
+    try std.testing.expectEqual(@as(f32, 5), try reply.readF32());
+
+    close(&test_session.clients, 0, &phase, false);
+    try std.testing.expectEqual(Pose{}, poseState(&test_session.clients, 0).*);
+}
+
+test "relative teleport echo resolves from a walking client's live position" {
+    if (comptime !pose_tracked or !features.movement) return error.SkipZigTest;
+
+    const config: MovementConfig = .{ .profile = .walk, .interval_ms = 50, .radius = 8, .speed = 4.3, .seed = 7 };
+    var phase: Phase = .disconnected;
+    var test_session = try TestSession.init(std.testing.allocator, .{ .movement = config });
+    defer test_session.deinit();
+    try onConnected(&test_session.clients, 0, &phase, 100, &test_session.packet_builder_buf, &test_session.write_temp_buf);
+    test_session.clearWriteBuffer();
+    phase = .play;
+
+    var buffer: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buffer.deinit();
+    var teleport = try protocol.PacketFrame.init(&buffer, packet_ids.play.clientbound.player_position);
+    try teleport.writer.writeVarInt(1);
+    try teleport.writer.writeF64(100);
+    try teleport.writer.writeF64(64);
+    try teleport.writer.writeF64(-100);
+    try teleport.writer.writeF64(0);
+    try teleport.writer.writeF64(0);
+    try teleport.writer.writeF64(0);
+    try teleport.writer.writeF32(0);
+    try teleport.writer.writeF32(0);
+    try teleport.writer.writeI32(0);
+    _ = try handlePlayPacket(
+        &test_session.clients,
+        0,
+        &phase,
+        .{ .id = packet_ids.play.clientbound.player_position, .payload = teleport.packetData()[1..] },
+        &test_session.packet_builder_buf,
+        &test_session.write_temp_buf,
+    );
+    test_session.clearWriteBuffer();
+
+    // Walk for a second so the live position leaves the teleport behind.
+    const motion = motionState(&test_session.clients, 0);
+    try std.testing.expect(motion.initialized);
+    var now_ms: u64 = 1000;
+    while (now_ms <= 2000) : (now_ms += config.interval_ms) updateMotion(.walk, motion, config, now_ms);
+    const walked = motionPose(motion);
+    try std.testing.expect(walked.x != 100 or walked.z != -100);
+
+    teleport = try protocol.PacketFrame.init(&buffer, packet_ids.play.clientbound.player_position);
+    try teleport.writer.writeVarInt(2);
+    try teleport.writer.writeF64(0);
+    try teleport.writer.writeF64(1);
+    try teleport.writer.writeF64(0);
+    try teleport.writer.writeF64(0);
+    try teleport.writer.writeF64(0);
+    try teleport.writer.writeF64(0);
+    try teleport.writer.writeF32(0);
+    try teleport.writer.writeF32(0);
+    try teleport.writer.writeI32(@bitCast(PositionRelative{ .x = true, .y = true, .z = true }));
+    _ = try handlePlayPacket(
+        &test_session.clients,
+        0,
+        &phase,
+        .{ .id = packet_ids.play.clientbound.player_position, .payload = teleport.packetData()[1..] },
+        &test_session.packet_builder_buf,
+        &test_session.write_temp_buf,
+    );
+
+    var reply_reader: Io.Reader = .fixed(test_session.writeBufferSlice());
+    var reply = protocol.PacketReader.init(&reply_reader);
+    _ = try reply.readVarInt();
+    _ = try reply.readVarInt();
+    try std.testing.expectEqual(@as(i32, 2), try reply.readVarInt());
+    try std.testing.expectEqual(walked.x, try reply.readF64());
+    try std.testing.expectEqual(walked.y + 1, try reply.readF64());
+    try std.testing.expectEqual(walked.z, try reply.readF64());
+    try std.testing.expectEqual(@as(f32, 0), try reply.readF32());
+    try std.testing.expectEqual(@as(f32, 0), try reply.readF32());
+    try std.testing.expectEqual(poseState(&test_session.clients, 0).*, motionPose(motion));
+    try std.testing.expect(!motion.has_target);
 }
 
 test "bounded walk remains inside its configured radius" {

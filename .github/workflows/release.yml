@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  ZIG_VERSION: 0.17.0-dev.1415+64dfaa568
+  ZIG_VERSION: 0.17.0-dev.1569+5f74e4f3f
 
 concurrency:
   group: release-${{ github.ref }}

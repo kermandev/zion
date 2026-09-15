@@ -37,7 +37,7 @@ const StoredSource = enum(u8) {
 
     // SharedSource maps onto the tail of this enum by adding the number of
     // owned variants, which must therefore come first and in the same order.
-    const shared_offset = @intFromEnum(StoredSource.broadcast_plain);
+    const shared_offset = @backingInt(StoredSource.broadcast_plain);
 
     comptime {
         const shared_info = @typeInfo(SharedSource).@"enum";
@@ -59,7 +59,7 @@ const StoredSource = enum(u8) {
     }
 
     fn shared(source: SharedSource) StoredSource {
-        return @enumFromInt(@intFromEnum(source) + shared_offset);
+        return @fromBackingInt(@intCast(@backingInt(source) + shared_offset));
     }
 
     fn ownedSlot(source: StoredSource) ?u1 {
@@ -71,8 +71,8 @@ const StoredSource = enum(u8) {
     }
 
     fn sharedSource(source: StoredSource) ?SharedSource {
-        const raw = @intFromEnum(source);
-        return if (raw >= shared_offset) @enumFromInt(raw - shared_offset) else null;
+        const raw = @backingInt(source);
+        return if (raw >= shared_offset) @fromBackingInt(@intCast(raw - shared_offset)) else null;
     }
 };
 
@@ -385,7 +385,7 @@ test "segment queue and total bytes are bounded" {
     defer queue.deinit(std.testing.allocator);
 
     inline for (0..segment_capacity) |i| {
-        try queue.enqueueShared(@enumFromInt(i % @typeInfo(SharedSource).@"enum".field_names.len), 1);
+        try queue.enqueueShared(@fromBackingInt(@intCast(i % @typeInfo(SharedSource).@"enum".field_names.len)), 1);
     }
     try std.testing.expectError(error.QueueFull, queue.enqueueShared(.broadcast_plain, 1));
     queue.clearRetainingCapacity();
@@ -514,7 +514,7 @@ test "randomized gathered-send state transitions preserve queue invariants" {
                     else => return err,
                 };
             },
-            1 => queue.enqueueShared(@enumFromInt(argument % @typeInfo(SharedSource).@"enum".field_names.len), @as(usize, argument) + 1) catch |err| switch (err) {
+            1 => queue.enqueueShared(@fromBackingInt(@intCast(argument % @typeInfo(SharedSource).@"enum".field_names.len)), @as(usize, argument) + 1) catch |err| switch (err) {
                 error.QueueFull, error.TooLarge => {},
             },
             2 => _ = queue.begin(),
@@ -561,7 +561,7 @@ fn fuzzQueueStateTransitions(_: void, smith: *std.testing.Smith) anyerror!void {
                     else => return err,
                 };
             },
-            1 => queue.enqueueShared(@enumFromInt(argument % @typeInfo(SharedSource).@"enum".field_names.len), @as(usize, argument) + 1) catch |err| switch (err) {
+            1 => queue.enqueueShared(@fromBackingInt(@intCast(argument % @typeInfo(SharedSource).@"enum".field_names.len)), @as(usize, argument) + 1) catch |err| switch (err) {
                 error.QueueFull, error.TooLarge => {},
             },
             2 => _ = queue.begin(),

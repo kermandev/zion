@@ -15,6 +15,8 @@ pub const writeResourcePackResponse = v26_1.writeResourcePackResponse;
 pub const writeKeepAlive = v26_1.writeKeepAlive;
 pub const writePong = v26_1.writePong;
 
+pub const accept_teleportation_includes_pose = v26_1.accept_teleportation_includes_pose;
+
 pub const packet_ids = struct {
     pub const handshake = v26_1.packet_ids.handshake;
     pub const status = v26_1.packet_ids.status;

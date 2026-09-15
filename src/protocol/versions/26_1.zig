@@ -4,7 +4,7 @@ pub fn writeHandshake(packet: anytype, host: []const u8, port: u16, next_state: 
     try packet.writeVarInt(protocol_version);
     try packet.writeString(host, 255);
     try packet.writeU16(port);
-    try packet.writeVarInt(@intFromEnum(next_state));
+    try packet.writeVarInt(@backingInt(next_state));
 }
 
 pub fn writeLoginStart(packet: anytype, username: []const u8, offline_uuid: [16]u8) @TypeOf(packet.*).Error!void {
@@ -45,6 +45,10 @@ pub fn writeChatMessage(packet: anytype, message: []const u8, real_ms: i64) @Typ
 pub fn writeChunkBatchReceived(packet: anytype) @TypeOf(packet.*).Error!void {
     try packet.writeF32(1.0);
 }
+
+/// The teleport acknowledgement carries only the teleport id, so the client
+/// does not track its own pose.
+pub const accept_teleportation_includes_pose = false;
 
 pub fn writeAcceptTeleportation(packet: anytype, teleport_id: i32) @TypeOf(packet.*).Error!void {
     try packet.writeVarInt(teleport_id);

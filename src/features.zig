@@ -7,3 +7,4 @@ pub const broadcast = build_options.enable_broadcast;
 pub const client_tick = build_options.enable_client_tick;
 pub const diagnostics = build_options.enable_diagnostics;
 pub const reconnect = build_options.enable_reconnect;
+pub const tui = build_options.enable_tui;
